@@ -468,3 +468,12 @@ nanobot provider login github-copilot    # GitHub Copilot OAuth
 ```
 
 启动后用 `nanobot agent` 在终端交互，无需配置任何频道。
+
+
+### 启动 Discord bot 实例
+
+可按照 `.nanobot.example` 配置后，按照下面的方式启动 `bot` 实例（如果有多个，则需要启动多个 bot 实例）。
+
+```
+nanobot gateway --config .nanobot/.bot-chat/config.json --workspace .nanobot/.bot-chat/workspace
+```

@@ -18,6 +18,13 @@
 
 📏 Real-time line count: run `bash core_agent_lines.sh` to verify anytime.
 
+## Jason-DEV
+
+当前仓库的 jason-dev 分支。
+
+
+
+
 ## 📢 News
 
 - **2026-03-08** 🚀 Released **v0.1.4.post4** — a reliability-packed release with safer defaults, better multi-instance support, sturdier MCP, and major channel and provider improvements. Please see [release notes](https://github.com/HKUDS/nanobot/releases/tag/v0.1.4.post4) for details.
