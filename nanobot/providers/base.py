@@ -44,7 +44,8 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-    
+    recovered_from_error: bool = False  # True when chat_with_retry succeeded after ≥1 transient failure
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
@@ -74,7 +75,7 @@ class LLMProvider(ABC):
     while maintaining a consistent interface.
     """
 
-    _CHAT_RETRY_DELAYS = (1, 2, 4)
+    _CHAT_RETRY_DELAYS = (1, 2, 4, 8, 16, 30)
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",
@@ -232,6 +233,8 @@ class LLMProvider(ABC):
                 )
 
             if response.finish_reason != "error":
+                if attempt > 1:
+                    response.recovered_from_error = True
                 return response
             if not self._is_transient_error(response.content):
                 return response
@@ -247,7 +250,7 @@ class LLMProvider(ABC):
             await asyncio.sleep(delay)
 
         try:
-            return await self.chat(
+            response = await self.chat(
                 messages=messages,
                 tools=tools,
                 model=model,
@@ -256,6 +259,9 @@ class LLMProvider(ABC):
                 reasoning_effort=reasoning_effort,
                 tool_choice=tool_choice,
             )
+            if response.finish_reason != "error":
+                response.recovered_from_error = True
+            return response
         except asyncio.CancelledError:
             raise
         except Exception as exc:

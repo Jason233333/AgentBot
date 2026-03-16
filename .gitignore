@@ -21,5 +21,6 @@ poetry.lock
 .pytest_cache/
 botpy.log
 nano.*.save
-./utils_repo
+utils_repo
+.nanobot/
 **/config.json

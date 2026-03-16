@@ -99,7 +99,11 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
-        self._processing_lock = asyncio.Lock()
+        # Per-session locks: messages within the same session are serialized,
+        # but different sessions run concurrently.
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        # Global semaphore caps total concurrent LLM calls across all sessions.
+        self._concurrency_sem = asyncio.Semaphore(32)
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
@@ -197,6 +201,16 @@ class AgentLoop:
                 tools=tool_defs,
                 model=self.model,
             )
+
+            if response.recovered_from_error:
+                logger.info(
+                    "LLM recovered from transient error — injecting resume prompt "
+                    "(iteration {}/{})", iteration, self.max_iterations
+                )
+                messages.append(
+                    {"role": "user", "content": "网络出现了短暂故障，请继续你之前的工作。"}
+                )
+                continue
 
             if response.has_tool_calls:
                 if on_progress:
@@ -302,27 +316,40 @@ class AgentLoop:
 
         asyncio.create_task(_do_restart())
 
+    def _get_session_lock(self, session_key: str) -> asyncio.Lock:
+        """Return (creating if needed) the per-session serialization lock."""
+        if session_key not in self._session_locks:
+            self._session_locks[session_key] = asyncio.Lock()
+        return self._session_locks[session_key]
+
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        async with self._processing_lock:
-            try:
-                response = await self._process_message(msg)
-                if response is not None:
-                    await self.bus.publish_outbound(response)
-                elif msg.channel == "cli":
+        """Process a message under a per-session lock and global semaphore.
+
+        Messages within the same session are serialized (preserving conversation
+        order), while messages from different sessions run concurrently up to
+        ``_concurrency_sem`` slots.
+        """
+        session_lock = self._get_session_lock(msg.session_key)
+        async with session_lock:
+            async with self._concurrency_sem:
+                try:
+                    response = await self._process_message(msg)
+                    if response is not None:
+                        await self.bus.publish_outbound(response)
+                    elif msg.channel == "cli":
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="", metadata=msg.metadata or {},
+                        ))
+                except asyncio.CancelledError:
+                    logger.info("Task cancelled for session {}", msg.session_key)
+                    raise
+                except Exception:
+                    logger.exception("Error processing message for session {}", msg.session_key)
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
+                        content="Sorry, I encountered an error.",
                     ))
-            except asyncio.CancelledError:
-                logger.info("Task cancelled for session {}", msg.session_key)
-                raise
-            except Exception:
-                logger.exception("Error processing message for session {}", msg.session_key)
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
-                ))
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""

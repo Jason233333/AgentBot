@@ -242,7 +242,9 @@ asyncio.create_task(_dispatch(msg))
         │  task 注册到 _active_tasks[session_key]
         │
         ▼
-_dispatch(msg) → async with _processing_lock  (全局锁，串行处理)
+_dispatch(msg)
+        │  → async with _session_lock[session_key]  (per-session 锁，同 session 串行)
+        │  → async with _concurrency_sem            (全局 Semaphore，最多 32 并发)
         │
         ▼
 _process_message(msg)
@@ -388,8 +390,11 @@ _run_agent_loop(messages)
     │           │
     │           ├─ _strip_think(content) → 清理 <think> 块
     │           ├─ 检查 finish_reason == "error"
-    │           │   是 → 不持久化到会话 (防止 error poison)
-    │           │   否 → add_assistant_message(messages, clean_content)
+    │           │   ├─ 瞬态错误 (503/rate-limit/timeout 等)
+    │           │   │   → 注入 user 消息 "请继续工作" → continue (保留 tool 上下文)
+    │           │   └─ 永久错误 (401/invalid_key 等)
+    │           │       → 不持久化到会话 (防止 error poison) → break
+    │           否 → add_assistant_message(messages, clean_content)
     │           ├─ final_content = clean_content
     │           └─ break → 跳出循环
     │
@@ -591,9 +596,10 @@ gateway() 的 run() finally 块:
 
 **关键设计细节**：
 
-- **processing_lock**：全局锁保证同一时间只处理一条消息，避免并发写会话冲突
+- **session_locks + concurrency_sem**：per-session 锁保证同一会话内消息串行处理（保留对话顺序），不同会话并发运行；全局 Semaphore（默认 32）防止并发数量无上限增长
 - **\_save_turn()**：保存新消息时截断超过 16KB 的工具结果、剥离 runtime context、替换 base64 图片
-- **error poison 防护**（loop.py:229）：LLM 返回 error 时不持久化到会话，避免"永久 400 循环"
+- **error poison 防护**：LLM 返回永久错误时不持久化到会话，避免"永久 400 循环"
+- **断网自动恢复**：瞬态错误（503/rate-limit/timeout）时注入 `"请继续工作"` user 消息并 `continue`，保留已完成的 tool 调用上下文，agent 无需用户重发即可恢复
 - **\_strip_think()**：清理部分模型（如 DeepSeek-R1）嵌入的 `<think>` 块
 - **MessageTool 检测**：如果代理在当前 turn 中已通过 `message` 工具主动发送了消息，则不再重复发送最终回复
 
@@ -658,7 +664,7 @@ gateway() 的 run() finally 块:
 **LLMProvider 基类**（`base.py`）：
 
 - `chat()`：抽象方法，由子类实现
-- `chat_with_retry()`：自动重试瞬态错误（429/500/502/503/504/timeout），延迟 1→2→4 秒
+- `chat_with_retry()`：自动重试瞬态错误（429/500/502/503/504/timeout），延迟 1→2→4→8→16→30 秒（共 6 次重试，总窗口 61 秒）
 - `GenerationSettings`：frozen dataclass，存储默认的 temperature/max_tokens/reasoning_effort
 - `_sanitize_empty_content()`：处理空内容（MCP 工具返回空值时），避免提供商 400 错误
 
@@ -810,5 +816,5 @@ gateway() 的 run() finally 块:
 
 **可改进点**：
 
-- `_processing_lock` 是全局的，不同会话之间也会互相阻塞，高并发场景可考虑改为 per-session 锁
+- Session 的 append-only 设计长期运行后 JSONL 文件会增长，虽然巩固不删消息但全量保存的开销值得关注（`_session_locks` 字典同理，长期运行 session 数量大时有轻微内存泄漏，可用 `weakref` 改进）
 - Session 的 append-only 设计长期运行后 JSONL 文件会增长，虽然巩固不删消息但全量保存的开销值得关注

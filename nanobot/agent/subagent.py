@@ -22,6 +22,12 @@ from nanobot.utils.helpers import build_assistant_message
 class SubagentManager:
     """Manages background subagent execution."""
 
+    # Maximum number of concurrently running subagents.
+    MAX_CONCURRENT = 10
+
+    # Default wall-clock timeout (seconds) for a single subagent run.
+    DEFAULT_TIMEOUT_S = 300
+
     def __init__(
         self,
         provider: LLMProvider,
@@ -32,6 +38,8 @@ class SubagentManager:
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        max_concurrent: int = MAX_CONCURRENT,
+        timeout_s: int = DEFAULT_TIMEOUT_S,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -43,6 +51,8 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.max_concurrent = max_concurrent
+        self.timeout_s = timeout_s
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -54,7 +64,24 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         session_key: str | None = None,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent to execute a task in the background.
+
+        Returns an error string (without raising) when the concurrency cap is
+        reached so the main agent can relay the message to the user.
+        """
+        running = len(self._running_tasks)
+        if running >= self.max_concurrent:
+            logger.warning(
+                "Subagent spawn rejected: concurrency cap ({}) reached ({} running)",
+                self.max_concurrent,
+                running,
+            )
+            return (
+                f"Cannot spawn subagent: the concurrency limit of "
+                f"{self.max_concurrent} is already reached. "
+                "Please wait for a running subagent to finish before spawning more."
+            )
+
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
@@ -85,9 +112,42 @@ class SubagentManager:
         label: str,
         origin: dict[str, str],
     ) -> None:
-        """Execute the subagent task and announce the result."""
+        """Execute the subagent task and announce the result.
+
+        The entire run is wrapped in ``asyncio.wait_for`` with ``self.timeout_s``
+        so a hung LLM call or infinite tool loop cannot leak resources forever.
+        """
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
+        try:
+            await asyncio.wait_for(
+                self._run_subagent_inner(task_id, task, label, origin),
+                timeout=self.timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Subagent [{}] timed out after {}s", task_id, self.timeout_s
+            )
+            await self._announce_result(
+                task_id,
+                label,
+                task,
+                f"Subagent timed out after {self.timeout_s} seconds.",
+                origin,
+                "error",
+            )
+        except asyncio.CancelledError:
+            logger.info("Subagent [{}] was cancelled", task_id)
+            raise
+
+    async def _run_subagent_inner(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+    ) -> None:
+        """Inner implementation of subagent execution (called inside wait_for)."""
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()

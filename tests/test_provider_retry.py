@@ -66,12 +66,16 @@ async def test_chat_with_retry_does_not_retry_non_transient_error(monkeypatch) -
 
 @pytest.mark.asyncio
 async def test_chat_with_retry_returns_final_error_after_retries(monkeypatch) -> None:
-    provider = ScriptedProvider([
-        LLMResponse(content="429 rate limit a", finish_reason="error"),
-        LLMResponse(content="429 rate limit b", finish_reason="error"),
-        LLMResponse(content="429 rate limit c", finish_reason="error"),
-        LLMResponse(content="503 final server error", finish_reason="error"),
-    ])
+    """After exhausting all retry delays the final attempt result is returned."""
+    from nanobot.providers.base import LLMProvider
+
+    n = len(LLMProvider._CHAT_RETRY_DELAYS)  # currently 6
+    # n transient errors (consumed during retry loop) + 1 final error
+    responses = [
+        LLMResponse(content=f"503 error {i}", finish_reason="error")
+        for i in range(n + 1)
+    ]
+    provider = ScriptedProvider(responses)
     delays: list[int] = []
 
     async def _fake_sleep(delay: int) -> None:
@@ -81,9 +85,34 @@ async def test_chat_with_retry_returns_final_error_after_retries(monkeypatch) ->
 
     response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
 
-    assert response.content == "503 final server error"
-    assert provider.calls == 4
-    assert delays == [1, 2, 4]
+    assert response.finish_reason == "error"
+    assert provider.calls == n + 1
+    assert delays == list(LLMProvider._CHAT_RETRY_DELAYS)
+
+
+@pytest.mark.asyncio
+async def test_chat_with_retry_full_delay_sequence(monkeypatch) -> None:
+    """Verify the extended retry delay sequence (1,2,4,8,16,30) exhausts correctly."""
+    from nanobot.providers.base import LLMProvider
+
+    # 6 transient errors → 6 retries (delays 1,2,4,8,16,30) → final attempt fails too
+    error_responses = [
+        LLMResponse(content=f"503 error {i}", finish_reason="error")
+        for i in range(7)
+    ]
+    provider = ScriptedProvider(error_responses)
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.finish_reason == "error"
+    assert delays == list(LLMProvider._CHAT_RETRY_DELAYS)
+    assert provider.calls == len(LLMProvider._CHAT_RETRY_DELAYS) + 1
 
 
 @pytest.mark.asyncio
