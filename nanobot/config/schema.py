@@ -35,6 +35,7 @@ class AgentDefaults(Base):
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
+    mode: Literal["normal", "zero", "normal-zero"] = "normal"  # LLM routing mode
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
     temperature: float = 0.1
@@ -88,6 +89,18 @@ class ProvidersConfig(Base):
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
+    claude_web: "ClaudeWebConfig" = Field(default_factory=lambda: ClaudeWebConfig())  # Claude Web (zero-token)
+
+
+class ClaudeWebConfig(Base):
+    """Claude Web (zero-token) provider configuration."""
+
+    session_key: str = ""  # sk-ant-sid01-xxx
+    cookie: str = ""  # full cookie string
+    user_agent: str = ""
+    organization_id: str = ""
+    chrome_cdp_url: str = "http://127.0.0.1:9222"
+    attach_only: bool = True  # True=attach to existing Chrome, False=launch new
 
 
 class HeartbeatConfig(Base):

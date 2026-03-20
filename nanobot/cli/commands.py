@@ -298,9 +298,27 @@ def _onboard_plugins(config_path: Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config."""
-    from nanobot.providers.base import GenerationSettings
+def _make_claude_web_provider(config: Config):
+    """Create a ClaudeWebProvider from config, loading saved credentials if needed."""
+    from nanobot.providers.claude_web_auth import load_credentials
+    from nanobot.providers.claude_web_provider import ClaudeWebProvider
+
+    cw = config.providers.claude_web
+    # Merge saved credentials with config (config takes precedence)
+    creds = load_credentials()
+    return ClaudeWebProvider(
+        session_key=cw.session_key or creds.get("session_key", ""),
+        cookie=cw.cookie or creds.get("cookie", ""),
+        user_agent=cw.user_agent or creds.get("user_agent", ""),
+        organization_id=cw.organization_id or creds.get("organization_id", ""),
+        chrome_cdp_url=cw.chrome_cdp_url,
+        attach_only=cw.attach_only,
+        default_model=config.agents.defaults.model,
+    )
+
+
+def _make_api_provider(config: Config):
+    """Create the standard API-based LLM provider from config."""
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
     from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
 
@@ -310,44 +328,69 @@ def _make_provider(config: Config):
 
     # OpenAI Codex (OAuth)
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        provider = OpenAICodexProvider(default_model=model)
+        return OpenAICodexProvider(default_model=model)
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    elif provider_name == "custom":
+    if provider_name == "custom":
         from nanobot.providers.custom_provider import CustomProvider
-        provider = CustomProvider(
+        return CustomProvider(
             api_key=p.api_key if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
         )
     # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
-    elif provider_name == "azure_openai":
+    if provider_name == "azure_openai":
         if not p or not p.api_key or not p.api_base:
             console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
             console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
             console.print("Use the model field to specify the deployment name.")
             raise typer.Exit(1)
-        provider = AzureOpenAIProvider(
+        return AzureOpenAIProvider(
             api_key=p.api_key,
             api_base=p.api_base,
             default_model=model,
         )
-    else:
-        from nanobot.providers.litellm_provider import LiteLLMProvider
-        from nanobot.providers.registry import find_by_name
-        spec = find_by_name(provider_name)
-        if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and (spec.is_oauth or spec.is_local)):
-            console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.nanobot/config.json under providers section")
-            raise typer.Exit(1)
-        provider = LiteLLMProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            provider_name=provider_name,
-        )
+    # Default: LiteLLM
+    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.registry import find_by_name
+    spec = find_by_name(provider_name)
+    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and (spec.is_oauth or spec.is_local)):
+        console.print("[red]Error: No API key configured.[/red]")
+        console.print("Set one in ~/.nanobot/config.json under providers section")
+        raise typer.Exit(1)
+    return LiteLLMProvider(
+        api_key=p.api_key if p else None,
+        api_base=config.get_api_base(model),
+        default_model=model,
+        extra_headers=p.extra_headers if p else None,
+        provider_name=provider_name,
+    )
 
+
+def _make_provider(config: Config):
+    """Create the appropriate LLM provider based on mode config.
+
+    Modes:
+        normal      — API provider only (default)
+        zero        — Claude Web provider only
+        normal-zero — API first, fallback to Claude Web on per-call failure
+    """
+    from nanobot.providers.base import GenerationSettings
+
+    mode = config.agents.defaults.mode
     defaults = config.agents.defaults
+
+    if mode == "zero":
+        provider = _make_claude_web_provider(config)
+        console.print("[cyan]Mode: zero-token (Claude Web)[/cyan]")
+    elif mode == "normal-zero":
+        from nanobot.providers.fallback_provider import FallbackProvider
+        primary = _make_api_provider(config)
+        secondary = _make_claude_web_provider(config)
+        provider = FallbackProvider(primary=primary, secondary=secondary)
+        console.print("[cyan]Mode: normal-zero (API → Claude Web fallback)[/cyan]")
+    else:
+        provider = _make_api_provider(config)
+
     provider.generation = GenerationSettings(
         temperature=defaults.temperature,
         max_tokens=defaults.max_tokens,
@@ -1001,16 +1044,24 @@ def _register_login(name: str):
 
 @provider_app.command("login")
 def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    provider: str = typer.Argument(..., help="Provider (e.g. 'openai-codex', 'github-copilot', 'claude-web')"),
 ):
-    """Authenticate with an OAuth provider."""
-    from nanobot.providers.registry import PROVIDERS
-
+    """Authenticate with a provider (OAuth or browser-based)."""
     key = provider.replace("-", "_")
+
+    # Check direct login handlers first (includes claude_web)
+    handler = _LOGIN_HANDLERS.get(key)
+    if handler:
+        console.print(f"{__logo__} Login - {provider}\n")
+        handler()
+        return
+
+    # Fall back to OAuth provider registry
+    from nanobot.providers.registry import PROVIDERS
     spec = next((s for s in PROVIDERS if s.name == key and s.is_oauth), None)
     if not spec:
-        names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
-        console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
+        oauth_names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
+        console.print(f"[red]Unknown provider: {provider}[/red]  Supported: {oauth_names}, claude-web")
         raise typer.Exit(1)
 
     handler = _LOGIN_HANDLERS.get(spec.name)
@@ -1061,6 +1112,41 @@ def _login_github_copilot() -> None:
         console.print("[green]✓ Authenticated with GitHub Copilot[/green]")
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@_register_login("claude_web")
+def _login_claude_web() -> None:
+    import asyncio
+
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    cdp_url = config.providers.claude_web.chrome_cdp_url
+
+    console.print(f"[cyan]Connecting to Chrome at {cdp_url}...[/cyan]")
+    console.print("Please log in to claude.ai in the browser window.\n")
+
+    async def _do_login():
+        from nanobot.providers.claude_web_auth import login_interactive
+        return await login_interactive(chrome_cdp_url=cdp_url)
+
+    try:
+        creds = asyncio.run(_do_login())
+        sk = creds.get("session_key", "")
+        console.print(f"[green]✓ Authenticated with Claude Web[/green]  [dim]{sk[:20]}...[/dim]")
+        console.print(f"[dim]Credentials saved to ~/.nanobot/credentials/claude-web.json[/dim]")
+    except ImportError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    except ConnectionError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    except TimeoutError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Login failed: {e}[/red]")
         raise typer.Exit(1)
 
 
