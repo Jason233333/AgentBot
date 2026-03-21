@@ -88,12 +88,14 @@ class ClaudeWebProvider(LLMProvider):
                 self._conversations[session_key] = conv_id
 
             # Send message
+            logger.debug("[zero-token] prompt ({} chars):\n{}", len(prompt), prompt[:500])
             response_text = await self._client.send_message(
                 conversation_id=conv_id,
                 prompt=prompt,
                 model=model,
                 attachments=attachments,
             )
+            logger.debug("[zero-token] raw response ({} chars):\n{}", len(response_text), response_text)
 
             # Parse response
             return self._parse_response(response_text)
@@ -300,6 +302,15 @@ class ClaudeWebProvider(LLMProvider):
         clean_text, tool_calls = parse_tool_calls(response_text)
 
         if tool_calls:
+            for tc in tool_calls:
+                logger.info(
+                    "[zero-token] parsed tool call: {}({}) [id={}]",
+                    tc.name,
+                    json.dumps(tc.arguments, ensure_ascii=False),
+                    tc.id,
+                )
+            if clean_text:
+                logger.debug("[zero-token] clean text after stripping XML: {}", clean_text[:200])
             return LLMResponse(
                 content=clean_text or None,
                 tool_calls=tool_calls,

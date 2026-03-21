@@ -10,6 +10,8 @@ import string
 import random
 from typing import Any
 
+from loguru import logger
+
 from nanobot.providers.base import ToolCallRequest
 
 
@@ -132,11 +134,15 @@ def parse_tool_calls(text: str) -> tuple[str, list[ToolCallRequest]]:
     if not matches:
         return text, []
 
+    logger.debug("[xml-parser] found {} <tool_call> tag(s) in response", len(matches))
+
     tool_calls: list[ToolCallRequest] = []
     for m in matches:
         call_id = m.group("id") or _short_id()
         name = m.group("name")
         body = m.group("body").strip()
+
+        logger.debug("[xml-parser] raw XML: <tool_call id=\"{}\" name=\"{}\">{}</tool_call>", call_id, name, body[:200])
 
         # Strip markdown code fences
         body = _CODE_FENCE_RE.sub("", body).strip()
@@ -145,6 +151,7 @@ def parse_tool_calls(text: str) -> tuple[str, list[ToolCallRequest]]:
         try:
             arguments = json.loads(body) if body else {}
         except json.JSONDecodeError:
+            logger.warning("[xml-parser] JSON parse failed for {}, trying json_repair: {}", name, body[:100])
             # Try json_repair as fallback
             try:
                 import json_repair
