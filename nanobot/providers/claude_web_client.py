@@ -229,56 +229,90 @@ class ClaudeWebClient:
         }
 
         # Use page.evaluate to perform fetch inside browser context
-        # This inherits all cookies and auth state
-        result = await self._page.evaluate(
-            """async ([orgId, convId, payload]) => {
-                const resp = await fetch(
-                    `https://claude.ai/api/organizations/${orgId}/chat_conversations/${convId}/completion`,
-                    {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload),
-                    }
-                );
-                if (!resp.ok) {
-                    const errText = await resp.text();
-                    throw new Error(`HTTP ${resp.status}: ${errText}`);
-                }
+        # This inherits all cookies and auth state.
+        # Timeout: 5 minutes for SSE stream (Claude can be slow on long responses).
+        _SSE_TIMEOUT_MS = 300_000
 
-                // Read SSE stream
-                const reader = resp.body.getReader();
-                const decoder = new TextDecoder();
-                let fullText = '';
-                let buffer = '';
+        try:
+            result = await asyncio.wait_for(
+                self._page.evaluate(
+                    """async ([orgId, convId, payload, timeoutMs]) => {
+                        const controller = new AbortController();
+                        const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\\n');
-                    buffer = lines.pop() || '';
-
-                    for (const line of lines) {
-                        if (!line.startsWith('data: ')) continue;
                         try {
-                            const data = JSON.parse(line.slice(6));
-                            if (data.type === 'completion' && data.completion) {
-                                fullText += data.completion;
-                            } else if (data.type === 'content_block_delta'
-                                       && data.delta && data.delta.text) {
-                                fullText += data.delta.text;
+                            const resp = await fetch(
+                                `https://claude.ai/api/organizations/${orgId}/chat_conversations/${convId}/completion`,
+                                {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify(payload),
+                                    signal: controller.signal,
+                                }
+                            );
+                            if (!resp.ok) {
+                                const errText = await resp.text();
+                                throw new Error(`HTTP ${resp.status}: ${errText}`);
                             }
-                        } catch (e) {
-                            // Skip non-JSON lines
-                        }
-                    }
-                }
 
-                return fullText;
-            }""",
-            [org_id, conversation_id, payload],
-        )
+                            // Read SSE stream
+                            const reader = resp.body.getReader();
+                            const decoder = new TextDecoder();
+                            let fullText = '';
+                            let buffer = '';
+                            let sseError = null;
+
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+
+                                buffer += decoder.decode(value, { stream: true });
+                                const lines = buffer.split('\\n');
+                                buffer = lines.pop() || '';
+
+                                for (const line of lines) {
+                                    if (!line.startsWith('data: ')) continue;
+                                    try {
+                                        const data = JSON.parse(line.slice(6));
+                                        if (data.type === 'completion' && data.completion) {
+                                            fullText += data.completion;
+                                        } else if (data.type === 'content_block_delta'
+                                                   && data.delta && data.delta.text) {
+                                            fullText += data.delta.text;
+                                        } else if (data.type === 'error') {
+                                            sseError = data.error || data;
+                                        } else if (data.type && !['message_start', 'message_delta',
+                                                   'message_stop', 'content_block_start',
+                                                   'content_block_stop', 'ping'].includes(data.type)) {
+                                            console.log('[zero-token-sse] unhandled event:', JSON.stringify(data).slice(0, 500));
+                                        }
+                                    } catch (e) {
+                                        // Skip non-JSON lines
+                                    }
+                                }
+                            }
+
+                            if (sseError) {
+                                throw new Error('SSE error: ' + JSON.stringify(sseError));
+                            }
+
+                            return fullText;
+                        } finally {
+                            clearTimeout(timer);
+                        }
+                    }""",
+                    [org_id, conversation_id, payload, _SSE_TIMEOUT_MS],
+                ),
+                timeout=_SSE_TIMEOUT_MS / 1000 + 10,  # Python-side timeout slightly longer
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Claude Web SSE stream timed out after {}s for conversation {}",
+                _SSE_TIMEOUT_MS / 1000, conversation_id[:8] + "...",
+            )
+            raise TimeoutError(
+                f"Claude Web response timed out after {_SSE_TIMEOUT_MS // 1000}s"
+            )
 
         return result or ""
 
@@ -318,11 +352,12 @@ class ClaudeWebClient:
             "claude3haiku": "claude-3-haiku-20240307",
         }
 
-        # Strip common prefixes
+        # Strip common prefixes (remove "anthropic/" or "claude_web/" from model string)
         clean = model_lower
         for prefix in ("anthropic/", "claude_web/"):
-            if model.lower().startswith(prefix):
-                clean = model_lower[len(prefix.replace("/", "")):]
+            prefix_norm = prefix.replace("-", "").replace("_", "")
+            if clean.startswith(prefix_norm):
+                clean = clean[len(prefix_norm):]
                 break
 
         for key, value in mapping.items():

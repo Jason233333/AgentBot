@@ -24,3 +24,4 @@ nano.*.save
 utils_repo
 .nanobot/
 **/config.json
+**/sessions/

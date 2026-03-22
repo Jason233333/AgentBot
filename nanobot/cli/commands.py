@@ -314,6 +314,7 @@ def _make_claude_web_provider(config: Config):
         chrome_cdp_url=cw.chrome_cdp_url,
         attach_only=cw.attach_only,
         default_model=config.agents.defaults.model,
+        workspace=config.workspace_path,
     )
 
 

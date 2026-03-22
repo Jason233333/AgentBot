@@ -652,8 +652,149 @@ from scripts.test_discord_e2e import start_nanobot, stop_nanobot, inject_message
 "
 ```
 
-### 已知问题
+### 已知问题（运维）
 
 1. **Claude Web 凭证提取**：`nanobot provider login claude-web` 可能因 `net::ERR_ABORTED` 失败（已登录时重定向冲突）。解决方案：直接用 CDP 脚本提取 cookie，跳过 login 导航。
 2. **Chrome 页面关闭**：如果 claude.ai 标签页被关闭/刷新，`Page.evaluate` 会抛 `TargetClosedError`。需保持标签页打开。
 3. **Discord Bot 权限**：Bot 需要 `Send Messages` 权限才能发送回复到频道。`Read Message History` + `View Channel` + Message Content Intent 用于 v2 DiscordReader 方案（v3 不需要）。
+
+---
+
+## Zero-Token Provider 状态管理问题与修复计划
+
+> 日期：2026-03-21
+> 参考实现：`utils_repo/openclaw-zero-token`
+
+### 问题全景
+
+通读 zero-token 相关代码后发现 11 个问题，**全部是 zero-token 模式专属**，normal 模式（LiteLLM/OpenAI）不受影响。根本原因：zero-token 把 claude.ai 当有状态的聊天窗口用（依赖服务端记住上下文），但状态管理做得不完善。
+
+#### P0 — 数据错乱 / 上下文丢失
+
+| # | 问题 | 场景 | 根因 | 代码位置 |
+|---|------|------|------|----------|
+| 1 | **Continuation 误判** | 历史里有旧 `role:"tool"` 消息 → 新用户消息也走 continuation path → 只发 tool results，不发 system prompt | `any(role=="tool")` 太粗暴，匹配到历史中的旧 tool results | `claude_web_provider.py:_convert_messages()` |
+| 2 | **Session key 错乱** | 不同频道/对话共用同一 system prompt → hash 相同 → 共用同一个 claude.ai conversation → 消息串台 | `_get_session_key()` 用 system prompt 前 200 字符 hash，不用 nanobot session_key | `claude_web_provider.py:_get_session_key()` |
+| 3 | **Continuation + conversation 丢失** | Chrome 崩溃/网络断/conversation 过期后，tool results 发到空白 conversation，无 system prompt、无 tool definitions | continuation path 假设 conversation 永远存活，无失效检测 | `claude_web_provider.py:_convert_continuation()` |
+
+#### P1 — 严重功能缺陷
+
+| # | 问题 | 场景 | 根因 |
+|---|------|------|------|
+| 4 | **SSE 解析忽略 error 事件** | claude.ai 限流/报错时 SSE 返回 error 事件 → 被忽略 → 返回空字符串 → agent 以为成功 | SSE parser 只处理 `completion` 和 `content_block_delta`，不处理 `error` / `message_limit` |
+| 5 | **`_active_session_key` 并发竞态** | 两个用户同时发消息 → `set_session_key("A")` 被 `set_session_key("B")` 覆盖 → A 的消息进了 B 的 conversation | `_active_session_key` 是共享可变状态，无并发保护 |
+| 6 | **Bot 重启丢 conversation 缓存** | `_conversations` 是纯内存 dict → 重启清空 → session 历史有 tool results → continuation 发到新 conversation 无上下文 | `_conversations` 不持久化 |
+| 7 | **`/new` 不清 conversation** | `/new` 清了 session 历史但没清 `_conversations` → 消息继续发到旧 conversation | AgentLoop 未调用 `clear_conversations()` |
+| 8 | **复用 conversation 时重复发历史** | 同一 session 的后续消息还是发完整 system prompt + 历史 → claude.ai 看到两遍历史 | `_convert_messages()` 不区分新建/复用 conversation |
+
+#### P2 — 次要
+
+| # | 问题 |
+|---|------|
+| 9 | Tool result `None` 序列化成字面量 `"null"` |
+| 10 | `_map_model()` 前缀剥离留残余 `/`（碰巧靠子串匹配工作） |
+| 11 | 图片附件转换失败静默跳过 |
+
+#### 已修复
+
+| # | 修复内容 | 日期 |
+|---|---------|------|
+| 1 | continuation 判断改为 `messages[-1].role == "tool"` | 2026-03-21 |
+| 2 | 添加 `set_session_key()` + `_active_session_key`，AgentLoop 传入 nanobot session_key | 2026-03-21 |
+| 7 | `/new` 时调用 `provider.clear_session(key)` | 2026-03-21 |
+| 8 | 添加 `full_prompt` 参数，复用 conversation 时只发新 user message | 2026-03-21 |
+
+### 参考实现：OpenClaw (`utils_repo/openclaw-zero-token`)
+
+OpenClaw 也是 zero-token 架构（通过浏览器自动化访问 claude.ai / deepseek / chatgpt），**整体设计思路和 nanobot 一致**（复用 conversation + continuation 增量发送），但在状态管理上做得更成熟。
+
+#### OpenClaw 的关键设计
+
+| 方面 | OpenClaw 做法 | nanobot 现状 |
+|------|-------------|-------------|
+| **session key 来源** | 外部传入，`sessionMap: Map<sessionKey, conversationId>` | ~~system prompt hash~~ → 已改为外部传入 |
+| **conversation 持久化** | 存磁盘（`SessionEntry` 文件），重启可恢复 | 纯内存 dict，重启丢失 |
+| **conversation 失效处理** | 检测失败 → 创建新 conversation → 发完整历史 → 自动恢复 | SSE error 静默忽略，返回空字符串 |
+| **并发隔离** | 每个 connection 有 `connId`，session 内消息排队处理 | ~~`_active_session_key` 共享变量~~ → 部分修复 |
+| **SSE 错误处理** | 捕获 error 事件，抛异常 | 忽略 error 事件 |
+| **context 压缩** | 接近 token limit 时才做 compaction（摘要） | MemoryConsolidator 按 token 阈值触发 |
+| **first turn vs continuation** | 首次发完整历史，后续只发新消息 | ~~每次都发完整历史~~ → 已修复 |
+
+#### OpenClaw 不适用于 nanobot 的部分
+
+| 方面 | 说明 |
+|------|------|
+| `parentMessageId` | DeepSeek Web 专用，Claude Web 不需要（线性 conversation 自动追加） |
+| WebSocket 连接模型 | nanobot 用 MessageBus，不用 WebSocket |
+| 多 provider 切换 | nanobot 的 zero-token 只支持 Claude Web |
+
+### 修复计划（方案 C：保留 conversation 复用，修状态管理）
+
+不改整体架构（conversation 复用 + continuation 增量发送），只修状态管理的细节。
+
+**参考 OpenClaw 的部分**：
+
+| 改动 | 参考 OpenClaw 什么 |
+|------|-------------------|
+| session_key 外部传入 | `sessionMap` 由上层传入 key，不自己算 hash |
+| conversation 失效检测 + fallback 重建 | 检测失败后创建新 conversation，发完整历史恢复 |
+| SSE error 捕获 | SSE 解析捕获 error 事件并抛异常 |
+| 并发隔离 | 每个 connection 独立 connId + session 内排队 |
+
+**未参考的部分**：
+
+| 方面 | 原因 |
+|------|------|
+| `parentMessageId` | Claude Web 不需要（线性 conversation 自动追加） |
+| conversation 持久化到磁盘 | 暂不做，优先级不高——重启后发完整历史即可恢复 |
+| WebSocket 连接模型 | nanobot 用 MessageBus，架构不同 |
+
+#### 阶段 1：修并发竞态（P1 #5）
+
+**目标**：消除 `_active_session_key` 共享变量。
+
+**做法**：
+- `chat()` 基类签名加 `**kwargs`，zero-token provider 从中取 `session_key`
+- AgentLoop 调用 `chat_with_retry()` 时传入 `session_key=key`
+- 删除 `set_session_key()` 和 `_active_session_key`
+
+**涉及文件**：
+- `nanobot/providers/base.py` — `chat()` / `chat_with_retry()` 加 `**kwargs`
+- `nanobot/providers/claude_web_provider.py` — `chat()` 从 kwargs 取 session_key
+- `nanobot/agent/loop.py` — 调用时传 `session_key=key`
+
+#### 阶段 2：conversation 失效检测 + 重建（P0 #3，P1 #6）
+
+**目标**：conversation 丢失时自动恢复。
+
+**做法**：
+- `send_message()` 返回空字符串 → 视为 conversation 失效
+- SSE error 事件 → 捕获并抛异常（修 P1 #4）
+- conversation 失效时：删除旧映射 → 创建新 conversation → 发完整 prompt 重试
+- 可选：持久化 `_conversations` 到磁盘（参照 OpenClaw 的 SessionEntry），重启可恢复
+
+**涉及文件**：
+- `nanobot/providers/claude_web_client.py` — SSE parser 加 error 事件处理
+- `nanobot/providers/claude_web_provider.py` — `chat()` 加失效检测 + fallback 逻辑
+
+#### 阶段 3：小修复（P2）
+
+- #9：`None` → `""` 而不是 `"null"`（一行改动）
+- #10：`_map_model()` 前缀剥离修正（一行改动）
+- #11：图片附件失败时 log 具体错误
+
+#### 验证计划
+
+每个阶段完成后用 `test_discord_e2e.py` 验证：
+
+```bash
+# 基础聊天
+python scripts/test_discord_e2e.py --test chat
+
+# Tool 调用
+python scripts/test_discord_e2e.py --test tool
+
+# Session 隔离（两个 session 同时发消息）
+# Conversation 恢复（kill Chrome 后重连）
+# /new 后的 session 清理
+```

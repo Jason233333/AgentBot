@@ -79,6 +79,7 @@ def format_tool_definitions(tools: list[dict[str, Any]]) -> str:
         "- The body MUST be valid JSON matching the tool's parameters.",
         "- You may call multiple tools in a single response.",
         "- When the user's request requires information you don't have, USE A TOOL.",
+        "- NEVER generate '[User]:' lines. You are the assistant — only output your own response.",
         "",
         "### Example",
         "",
