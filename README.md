@@ -128,6 +128,7 @@ cp bots/bot-chat/config.json.example bots/bot-chat/config.json
 
 > 也可以同时配置 `providers.anthropic.apiKey`，这样 API 模式作为 fallback 可用。
 
+<<<<<<< HEAD
 #### 5. 启动 nanobot
 
 ```bash
@@ -139,12 +140,26 @@ python -m nanobot gateway \
 
 > 将 `/path/to/AgentBot` 替换为你的实际项目路径。
 
+=======
+#### 4. 启动 nanobot
+
+```bash
+python -m nanobot gateway \
+  --config bots/bot-chat/config.json \
+  --workspace bots/bot-chat/workspace
+```
+
+>>>>>>> 5c9b193 (docs: add zero-token mode guide to Jason-DEV section in README)
 正常启动后日志会显示：
 ```
 [zero-token] Connected to Chrome via CDP at http://127.0.0.1:9222
 ```
 
+<<<<<<< HEAD
 #### 6. 测试
+=======
+#### 5. 测试
+>>>>>>> 5c9b193 (docs: add zero-token mode guide to Jason-DEV section in README)
 
 **单元测试（无需 Chrome）：**
 
