@@ -254,50 +254,68 @@ def search_arxiv(query, limit=3):
         return []
 
 # ---------------------------------------------------------------------------
-# Platform: XiaoHongShu (via mcporter)
+# Platform: XiaoHongShu (via Streamable HTTP MCP on localhost:18060)
 # ---------------------------------------------------------------------------
-MCPORTER_CWD = "/Users/shingz/Documents/Project/AgentBot/bots/bot-chat/workspace"
+import http.client as _http
 
 def search_xiaohongshu(query, limit=3):
+    """Search XiaoHongShu via MCP Streamable HTTP (initialize + session)."""
     try:
-        cmd = ["mcporter", "call", f'xiaohongshu.search_feeds(keyword: "{query}")']
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=MCPORTER_CWD)
-        if result.returncode != 0:
-            print(f"[xiaohongshu] mcporter error: {result.stderr[:200]}", file=sys.stderr)
+        # Step 1: Initialize to get session ID
+        conn = _http.HTTPConnection('localhost', 18060, timeout=10)
+        init = json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize','params':{
+            'protocolVersion':'2024-11-05','capabilities':{},
+            'clientInfo':{'name':'cdp-search','version':'1.0'}
+        }})
+        conn.request('POST', '/mcp', body=init, headers={'Content-Type':'application/json'})
+        resp = conn.getresponse()
+        session_id = resp.getheader('Mcp-Session-Id')
+        resp.read()  # consume body
+        conn.close()
+        if not session_id:
+            print("[xiaohongshu] No Mcp-Session-Id in initialize response", file=sys.stderr)
             return []
-        data = json.loads(result.stdout)
-        # mcporter returns: {feeds: [...]} or [{...}] or {feeds: [{feeds: [...]}]}
-        if isinstance(data, list):
-            # Could be [{feeds: [...]}, ...]
-            items = []
-            for d in data:
-                if isinstance(d, dict) and "feeds" in d:
-                    items.extend(d["feeds"])
-                else:
-                    items.append(d)
-        elif isinstance(data, dict):
-            items = data.get("feeds", data.get("items", []))
-        else:
-            items = []
+
+        # Step 2: Call search_notes with session ID
+        conn2 = _http.HTTPConnection('localhost', 18060, timeout=15)
+        call = json.dumps({'jsonrpc':'2.0','id':2,'method':'tools/call','params':{
+            'name':'search_notes',
+            'arguments':{'keyword': query, 'page': 1, 'sort': 'general', 'note_type': 0}
+        }})
+        conn2.request('POST', '/mcp', body=call, headers={
+            'Content-Type':'application/json', 'Mcp-Session-Id': session_id
+        })
+        resp2 = conn2.getresponse()
+        data = json.loads(resp2.read())
+        conn2.close()
+        if 'error' in data:
+            print(f"[xiaohongshu] MCP error: {data['error']}", file=sys.stderr)
+            return []
+        content = data.get('result', {}).get('content', [])
+        notes = []
+        for block in content:
+            if block.get('type') == 'text':
+                try:
+                    notes = json.loads(block['text'])
+                except json.JSONDecodeError:
+                    pass
         results = []
-        for item in (items or [])[:limit]:
-            nc = item.get("noteCard", item.get("note_card", {}))
-            title = nc.get("displayTitle", "") or nc.get("display_title", "") or item.get("title", "")
-            nid = item.get("id", "") or item.get("note_id", "")
-            interact = nc.get("interactInfo", nc.get("interact_info", {}))
-            user = nc.get("user", {})
+        for note in (notes or [])[:limit]:
             results.append({
-                "title": title,
-                "url": f"https://www.xiaohongshu.com/explore/{nid}" if nid else "",
-                "snippet": f"likes: {interact.get('likedCount', interact.get('liked_count', ''))}, collected: {interact.get('collectedCount', interact.get('collected_count', ''))}",
-                "source": "xiaohongshu",
-                "extra": {
-                    "likes": interact.get("likedCount", interact.get("liked_count", "")),
-                    "collected": interact.get("collectedCount", interact.get("collected_count", "")),
-                    "author": user.get("nickname", user.get("nickName", ""))
+                'title': note.get('title', ''),
+                'url': note.get('noteUrl', f"https://www.xiaohongshu.com/explore/{note.get('id', '')}"),
+                'snippet': note.get('desc', '')[:200],
+                'source': 'xiaohongshu',
+                'extra': {
+                    'likes': note.get('likes', ''),
+                    'collected': note.get('collected', ''),
+                    'author': note.get('author', note.get('nickname', ''))
                 }
             })
         return results
+    except ConnectionRefusedError:
+        print("[xiaohongshu] MCP server not running on localhost:18060", file=sys.stderr)
+        return []
     except Exception as e:
         print(f"[xiaohongshu] Error: {e}", file=sys.stderr)
         return []

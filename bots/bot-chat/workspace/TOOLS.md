@@ -1,15 +1,26 @@
 # Tool Usage Notes
 
-Tool signatures are provided automatically via function calling.
-This file documents non-obvious constraints and usage patterns.
+## 获取外部信息
 
-## exec — Safety Limits
+当涉及到`调研`、`搜索`、`回答问题`等需要获取外部信息的指令时，请使用`cdp-search` skill。
 
-- Commands have a configurable timeout (default 60s)
-- Dangerous commands are blocked (rm -rf, format, dd, shutdown, etc.)
-- Output is truncated at 10,000 characters
-- `restrictToWorkspace` config can limit file access to the workspace
+### 示例问题
 
-## cron — Scheduled Reminders
+- 今天的金价是多少？
+- 感冒不能吃什么？
+- 帮我调研下怎么开发一个软件？
+- 北京今年热门的景点是什么？
+...
 
-- Please refer to cron skill for usage.
+对于类似的问题，请使用搜索工具，例如`cdp-search` skill。
+
+### 答案注明出处
+
+当获取外部知识时，请在最后的回复里注明出处：
+
+文献1 url: <url> 摘要：
+...
+文献2 url: <url> 摘要：
+...
+
+<最后在此处给出回答>

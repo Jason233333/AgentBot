@@ -46,7 +46,7 @@ python3 $SCRIPT -r https://zhuanlan.zhihu.com/p/12345
 | google | CDP (new tab) | No | General, English |
 | baidu | CDP (new tab) | No | Chinese general |
 | zhihu | CDP (reuse tab) | Logged in | Knowledge, Q&A |
-| xiaohongshu | mcporter MCP | Logged in | Lifestyle, travel, reviews |
+| xiaohongshu | Native MCP binary (stdio) | Logged in | Lifestyle, travel, reviews |
 | github | `gh search repos` | Yes (`gh auth`) | Repos, code (sorted by stars) |
 | arxiv | Atom API | No | Academic papers |
 
@@ -103,16 +103,16 @@ Platform-specific `extra` fields:
 
 - **Chrome**: Must be running with `--remote-debugging-port=9222 --remote-allow-origins=*`.
 - **Zhihu**: Must reuse existing logged-in tab. New CDP tabs don't inherit session. If results are empty, user needs to re-login in Chrome.
-- **XiaoHongShu**: Uses mcporter + native binary. mcporter must be run from workspace dir (hardcoded CWD). Cookies at `/tmp/xhs-data/cookies.json`.
+- **XiaoHongShu**: Connects to MCP HTTP server at `localhost:18060/mcp` (Docker container, v2.0.0). Uses Streamable HTTP MCP: initialize to get session ID, then tools/call with `Mcp-Session-Id` header. Cookies managed by the container.
 - **GitHub**: Uses `gh search repos` (authenticated via `gh auth login`, 5000 req/hr). Returns results sorted by stars with fullName, description, stargazersCount, url, language, updatedAt.
 - **arXiv**: Pure HTTP API, no CDP needed. Always available.
-- **Dependencies**: Python 3.12+, `websocket-client` pip package, `gh` CLI v2.x (for GitHub), `mcporter` (for XiaoHongShu).
+- **Dependencies**: Python 3.12+, `websocket-client` pip package, `gh` CLI v2.x (for GitHub), `xiaohongshu-mcp` binary (for XiaoHongShu).
 
 ## Troubleshooting
 
 - **403 on WebSocket**: Chrome missing `--remote-allow-origins=*` flag.
 - **Zhihu empty results**: Tab lost session — re-login in Chrome.
-- **XiaoHongShu errors**: Check mcporter is running, cookies not expired. Re-extract cookies from Chrome if needed.
+- **XiaoHongShu errors**: Check binary exists at `/tmp/xiaohongshu-mcp-darwin-arm64`, cookies not expired. Re-extract cookies from Chrome if needed.
 - **Google/Baidu empty**: Selector changes — check setup-notes.md for current selectors.
 
 See [references/setup-notes.md](references/setup-notes.md) for installation history, CDP pitfalls, selector notes, and login procedures.

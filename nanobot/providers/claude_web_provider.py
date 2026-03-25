@@ -3,6 +3,12 @@
 Implements LLMProvider by routing requests through claude.ai Web interface
 via Playwright browser automation. Converts between standard OpenAI-style
 messages/tools and XML-based text format.
+
+Hybrid mode: new user messages create a fresh conversation with the full
+prompt (system + history + tools); tool continuations within the same
+agent loop reuse the existing conversation with incremental messages.
+This avoids context mixing from replayed history while keeping tool
+round-trips efficient.
 """
 
 from __future__ import annotations
@@ -10,12 +16,14 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.providers.claude_web_client import ClaudeWebClient, ClaudeWebClientConfig
 from nanobot.providers.xml_tool_parser import (
     format_tool_definitions,
@@ -27,21 +35,22 @@ from nanobot.providers.xml_tool_parser import (
 class ClaudeWebProvider(LLMProvider):
     """LLM provider that uses claude.ai Web interface via browser automation.
 
+    Hybrid conversation management:
+    - New user message → create fresh conversation, send full prompt
+    - Tool continuation (last msg is role="tool") → reuse conversation,
+      send only incremental tool results
+
+    This avoids context mixing (from replayed history in full prompts)
+    while keeping tool round-trips efficient within the same agent loop.
+
     Session always stores standard JSON format. This provider handles:
     - Outbound: JSON messages + tool defs → XML-injected text prompt
     - Inbound: Plain text response → parsed LLMResponse with ToolCallRequests
     """
 
-    # Max user turns to include in full prompt (new conversation).
+    # Max user turns to include in full prompt.
     # Keeps prompt focused on recent context; older history is discarded.
     _MAX_HISTORY_TURNS = 10
-
-    # After this many LLM round-trips in one claude.ai conversation,
-    # rotate to a new conversation so the system prompt is re-injected.
-    # claude.ai's context window will start dropping early content (including
-    # the system prompt) after many turns, causing the model to "forget" its
-    # identity and capabilities.
-    _CONV_ROTATION_TURNS = 20
 
     def __init__(
         self,
@@ -64,55 +73,23 @@ class ClaudeWebProvider(LLMProvider):
             chrome_cdp_url=chrome_cdp_url,
             attach_only=attach_only,
         ))
-        # session_key (nanobot session) → conversation_id (claude.ai)
-        # Persisted to disk so conversations survive restarts.
-        self._conv_file: Path | None = None
-        if workspace:
-            self._conv_file = Path(workspace) / "sessions" / ".conversations.json"
-        self._conversations: dict[str, str] = self._load_conversations()
-        self._turn_counts: dict[str, int] = {}  # session_key → turn count
         self._system_prompt_logged: bool = False
+        # In-memory conversation tracking: session_key → conversation_id.
+        # Used to reuse conversations for tool continuations.
+        self._conversations: dict[str, str] = {}
 
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         return self._default_model
 
-    def _load_conversations(self) -> dict[str, str]:
-        """Load conversation mappings from disk."""
-        if not self._conv_file or not self._conv_file.exists():
-            return {}
-        try:
-            data = json.loads(self._conv_file.read_text(encoding="utf-8"))
-            logger.info("[zero-token] loaded {} conversation mappings from disk", len(data))
-            return data
-        except Exception:
-            logger.warning("[zero-token] failed to load conversations file, starting fresh")
-            return {}
-
-    def _save_conversations(self) -> None:
-        """Persist conversation mappings to disk."""
-        if not self._conv_file:
-            return
-        try:
-            self._conv_file.parent.mkdir(parents=True, exist_ok=True)
-            self._conv_file.write_text(
-                json.dumps(self._conversations, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception:
-            logger.warning("[zero-token] failed to save conversations file")
-
     def clear_session(self, key: str | None = None) -> None:
-        """Clear conversation mapping for a session (or all if key is None)."""
-        if key is None:
-            self._conversations.clear()
-            logger.info("[zero-token] cleared all conversation mappings")
-            self._turn_counts.clear()
-        elif key in self._conversations:
+        """Clear tracked conversation for the given session key."""
+        if key and key in self._conversations:
             del self._conversations[key]
-            self._turn_counts.pop(key, None)
-            logger.info("[zero-token] cleared conversation for session {}", key)
-        self._save_conversations()
+            logger.debug("[zero-token] cleared conversation for session {}", key)
+        elif not key:
+            self._conversations.clear()
+            logger.debug("[zero-token] cleared all conversations")
 
     async def chat(
         self,
@@ -127,134 +104,62 @@ class ClaudeWebProvider(LLMProvider):
     ) -> LLMResponse:
         """Send a chat request via Claude Web.
 
-        Converts standard messages/tools to XML prompt, sends through browser,
-        parses response back to standard LLMResponse.
+        Hybrid mode:
+        - If last message is role="tool" and we have an existing conversation
+          for this session → reuse conversation, send only tool results.
+        - Otherwise → create a new conversation, send full prompt.
         """
         model = model or self._default_model
-
-        # Get session key from kwargs (passed by AgentLoop), fallback to system prompt hash
-        session_key = kwargs.get("session_key") or self._get_session_key(messages)
-        logger.debug("[zero-token] session_key={}, conversation={}", session_key, self._conversations.get(session_key, "new"))
+        session_key = kwargs.get("session_key", self._get_session_key(messages))
 
         try:
-            return await self._chat_with_fallback(
-                session_key, messages, tools, model,
-            )
-        except Exception as exc:
-            logger.exception("Claude Web request failed")
-            return LLMResponse(
-                content=f"Error calling Claude Web: {exc}",
-                finish_reason="error",
+            is_continuation = (
+                messages
+                and messages[-1].get("role") == "tool"
+                and session_key in self._conversations
             )
 
-    async def _chat_with_fallback(
-        self,
-        session_key: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-        model: str,
-    ) -> LLMResponse:
-        """Send message with automatic conversation rebuild on failure.
+            if is_continuation:
+                conv_id = self._conversations[session_key]
+                prompt = self._convert_continuation(messages)
+                attachments: list[dict[str, Any]] = []
+                logger.info(
+                    "[zero-token] continuation in conv={} ({} chars)",
+                    conv_id[:8] + "...", len(prompt),
+                )
+            else:
+                conv_id = await self._client.create_conversation(model)
+                self._conversations[session_key] = conv_id
+                prompt, attachments = self._convert_messages(messages, tools)
+                logger.info(
+                    "[zero-token] new conversation={} ({} chars)",
+                    conv_id[:8] + "...", len(prompt),
+                )
 
-        If an existing conversation fails (SSE error, empty response),
-        creates a new conversation and retries with full prompt.
-        """
-        conv_id = self._conversations.get(session_key)
-        turn_count = self._turn_counts.get(session_key, 0)
-
-        # Rotate conversation when turn count exceeds threshold.
-        # This re-injects the system prompt so the model doesn't "forget"
-        # its identity/tools after many turns in a long conversation.
-        if conv_id is not None and turn_count >= self._CONV_ROTATION_TURNS:
-            logger.info(
-                "[zero-token] rotating conversation for session {} after {} turns",
-                session_key, turn_count,
+            logger.debug(
+                "[zero-token] prompt ({} chars, conv={}):\n{}",
+                len(prompt), conv_id[:8] + "...", prompt[:500],
             )
-            self._conversations.pop(session_key, None)
-            self._turn_counts[session_key] = 0
-            conv_id = None
-
-        is_new_conversation = conv_id is None
-        if is_new_conversation:
-            conv_id = await self._client.create_conversation(model)
-            self._conversations[session_key] = conv_id
-            self._save_conversations()
-
-        prompt, attachments = self._convert_messages(
-            messages, tools, full_prompt=is_new_conversation,
-        )
-
-        try:
-            logger.debug("[zero-token] prompt ({} chars, full={}):\n{}", len(prompt), is_new_conversation, prompt[:500])
             response_text = await self._client.send_message(
                 conversation_id=conv_id,
                 prompt=prompt,
                 model=model,
                 attachments=attachments,
             )
-        except Exception:
-            if is_new_conversation:
-                raise  # No point rebuilding if this was already a fresh conversation
-            logger.warning(
-                "[zero-token] conversation {} failed, rebuilding with full prompt",
-                conv_id[:8] + "...",
+            logger.debug(
+                "[zero-token] response ({} chars):\n{}",
+                len(response_text), response_text[:500] if response_text else "",
             )
-            return await self._rebuild_conversation(
-                session_key, messages, tools, model,
+            return self._parse_response(response_text)
+        except Exception as exc:
+            logger.exception("Claude Web request failed")
+            # Clear conversation on error so next call creates a fresh one
+            self._conversations.pop(session_key, None)
+            error_msg = self._format_error(exc)
+            return LLMResponse(
+                content=error_msg,
+                finish_reason="error",
             )
-
-        # Empty response from existing conversation → likely conversation lost
-        if not response_text and not is_new_conversation:
-            logger.warning(
-                "[zero-token] empty response from conversation {}, rebuilding",
-                conv_id[:8] + "...",
-            )
-            return await self._rebuild_conversation(
-                session_key, messages, tools, model,
-            )
-
-        # Track turn count for conversation rotation
-        self._turn_counts[session_key] = self._turn_counts.get(session_key, 0) + 1
-        logger.debug("[zero-token] session {} turn count: {}/{}", session_key, self._turn_counts[session_key], self._CONV_ROTATION_TURNS)
-
-        logger.debug("[zero-token] raw response ({} chars):\n{}", len(response_text), response_text)
-        return self._parse_response(response_text)
-
-    async def _rebuild_conversation(
-        self,
-        session_key: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-        model: str,
-    ) -> LLMResponse:
-        """Delete old conversation mapping, create new one, send full prompt."""
-        # Remove stale mapping and reset turn counter
-        self._conversations.pop(session_key, None)
-        self._turn_counts[session_key] = 0
-
-        # Create fresh conversation
-        conv_id = await self._client.create_conversation(model)
-        self._conversations[session_key] = conv_id
-        self._save_conversations()
-        logger.info("[zero-token] rebuilt conversation {} for session {}", conv_id[:8] + "...", session_key)
-
-        # Send full prompt (all history + tools)
-        prompt, attachments = self._convert_messages(
-            messages, tools, full_prompt=True,
-        )
-        logger.debug("[zero-token] rebuild prompt ({} chars):\n{}", len(prompt), prompt[:500])
-        response_text = await self._client.send_message(
-            conversation_id=conv_id,
-            prompt=prompt,
-            model=model,
-            attachments=attachments,
-        )
-        logger.debug("[zero-token] rebuild response ({} chars):\n{}", len(response_text), response_text)
-        return self._parse_response(response_text)
-
-    def clear_conversations(self) -> None:
-        """Clear conversation mapping (e.g. on /new command)."""
-        self._conversations.clear()
 
     # ------------------------------------------------------------------
     # Message conversion: JSON → XML prompt
@@ -264,15 +169,11 @@ class ClaudeWebProvider(LLMProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        full_prompt: bool = True,
     ) -> tuple[str, list[dict[str, Any]]]:
         """Convert standard messages list to a single prompt for Claude Web.
 
-        Args:
-            messages: Standard message list.
-            tools: Tool definitions.
-            full_prompt: If True, send full prompt (system + history + tools).
-                         If False, only send new content (existing conversation).
+        Always builds a full prompt (system + tools + history) since each
+        call uses a fresh conversation (stateless mode).
 
         Returns:
             Tuple of (prompt_text, attachments_list).
@@ -289,50 +190,14 @@ class ClaudeWebProvider(LLMProvider):
                     self._system_prompt_logged = True
                     break
 
-        # Check if this is a continuation: the LAST message(s) are tool results
-        # from the current agent loop iteration (not historical tool results)
-        is_continuation = (
-            len(messages) > 0
-            and messages[-1].get("role") == "tool"
-        )
-
         # Log message composition for debugging
         role_summary = [m.get("role", "?") for m in messages]
         logger.info(
-            "[zero-token] _convert_messages: {} msgs, roles={}, full_prompt={}, is_continuation={}",
-            len(messages), role_summary, full_prompt, is_continuation,
+            "[zero-token] _convert_messages: {} msgs, roles={}",
+            len(messages), role_summary,
         )
 
-        # Build a tool reminder for continuation/existing conversation paths
-        # so Claude doesn't "forget" it has tools after many turns.
-        tool_hint = ""
-        if tools and not full_prompt:
-            tool_names = [
-                (t.get("function", t) or {}).get("name", "?") for t in tools
-            ]
-            tool_hint = (
-                '\n\n[SYSTEM HINT]: You have tools available: '
-                + ", ".join(tool_names)
-                + '. To use a tool, output: <tool_call id="unique_id" name="tool_name">{"param": "value"}</tool_call>'
-            )
-
-        # If continuation with tool results, only send the new tool results
-        if is_continuation:
-            logger.debug("[zero-token] continuation path: last message is tool result")
-            prompt, atts = self._convert_continuation(messages)
-            return prompt + tool_hint, atts
-
-        # Existing conversation: only send the last user message
-        if not full_prompt:
-            logger.debug("[zero-token] existing conversation: sending only new user message")
-            for msg in reversed(messages):
-                if msg.get("role") == "user":
-                    text, msg_attachments = self._extract_user_content(msg)
-                    return (text or "") + tool_hint, msg_attachments
-            return tool_hint, []
-
-        # New conversation: aggregate everything into a single prompt
-        # 1. System message + tool definitions
+        # 1. System message
         for msg in messages:
             if msg.get("role") == "system":
                 parts.append(msg.get("content", ""))
@@ -345,22 +210,20 @@ class ClaudeWebProvider(LLMProvider):
             "user to reply."
         )
 
-        # Inject tool definitions
+        # 2. Inject tool definitions
         if tools:
             tool_text = format_tool_definitions(tools)
             if tool_text:
                 parts.append(tool_text)
 
-        # 2. History messages (skip system, already handled)
-        # Limit history to last N user turns to avoid overly long prompts
-        # that confuse Claude about what's "current" vs "historical".
+        # 3. History messages (skip system, already handled)
+        # Limit history to last N user turns to avoid overly long prompts.
         history_msgs = [m for m in messages if m.get("role") != "system"]
         history_msgs = self._limit_history_turns(history_msgs, self._MAX_HISTORY_TURNS)
 
-        # Split history into "old turns" and "current turn" (last user msg + its tool calls).
-        # Old turns: only keep user messages + final assistant text (skip tool_call/tool_result noise).
-        # Current turn: keep everything (user + assistant tool_calls + tool_results) so the
-        # model can continue from where the agent loop left off.
+        # Split into "old turns" and "current turn" (last user msg + its tool calls).
+        # Old turns: condensed (user + assistant text only, skip tool noise).
+        # Current turn: full detail (tool_calls + tool_results preserved).
         last_user_idx = -1
         for i in range(len(history_msgs) - 1, -1, -1):
             if history_msgs[i].get("role") == "user":
@@ -370,7 +233,7 @@ class ClaudeWebProvider(LLMProvider):
         old_msgs = history_msgs[:last_user_idx] if last_user_idx > 0 else []
         current_msgs = history_msgs[last_user_idx:] if last_user_idx >= 0 else history_msgs
         logger.info(
-            "[zero-token] full_prompt split: {} old msgs (condensed), {} current msgs (full detail)",
+            "[zero-token] prompt split: {} old msgs (condensed), {} current msgs (full detail)",
             len(old_msgs), len(current_msgs),
         )
 
@@ -384,10 +247,7 @@ class ClaudeWebProvider(LLMProvider):
                 attachments.extend(msg_attachments)
             elif role == "assistant":
                 content = msg.get("content", "")
-                # Only include assistant messages with actual text (skip tool-call-only messages)
                 if content:
-                    # Strip embedded <tool_response>/<tool_call> XML from old assistant content
-                    # (these can appear when history was saved with tool output inline)
                     content = self._strip_tool_xml(content)
                     if content:
                         parts.append(f"[Assistant]: {content}")
@@ -433,52 +293,36 @@ class ClaudeWebProvider(LLMProvider):
         prompt = "\n\n".join(parts)
         return prompt, attachments
 
-    def _convert_continuation(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]]]:
-        """Convert continuation messages (tool results) to prompt text.
+    @staticmethod
+    def _convert_continuation(messages: list[dict[str, Any]]) -> str:
+        """Build an incremental prompt containing only new tool results.
 
-        Only sends new tool results since the last assistant message.
+        Used when reusing an existing conversation for tool continuations.
+        Only includes tool result messages that follow the last assistant
+        message with tool_calls.
         """
-        parts: list[str] = []
-        attachments: list[dict[str, Any]] = []
-
-        # Find the last assistant message with tool_calls, then collect tool results after it
+        # Find the last assistant message with tool_calls
         last_assistant_idx = -1
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "assistant" and messages[i].get("tool_calls"):
                 last_assistant_idx = i
                 break
 
-        if last_assistant_idx < 0:
-            # No tool calls found, just send the last user message
-            for msg in reversed(messages):
-                if msg.get("role") == "user":
-                    text, msg_attachments = self._extract_user_content(msg)
-                    return text or "", msg_attachments
-            return "", []
-
-        # Collect tool results after the last assistant tool_call
-        for msg in messages[last_assistant_idx + 1:]:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-
-            if role == "tool":
+        # Collect tool results after the last assistant tool_call message
+        parts: list[str] = []
+        start = last_assistant_idx + 1 if last_assistant_idx >= 0 else 0
+        for msg in messages[start:]:
+            if msg.get("role") == "tool":
                 tc_id = msg.get("tool_call_id", "")
                 tc_name = msg.get("name", "")
-                result = content if isinstance(content, str) else ("" if content is None else json.dumps(content, ensure_ascii=False))
+                content = msg.get("content", "")
+                result = (
+                    content if isinstance(content, str)
+                    else ("" if content is None else json.dumps(content, ensure_ascii=False))
+                )
                 parts.append(format_tool_result(tc_id, tc_name, result))
-            elif role == "user":
-                text, msg_attachments = self._extract_user_content(msg)
-                if text:
-                    parts.append(text)
-                attachments.extend(msg_attachments)
 
-        if parts:
-            parts.append("\nPlease proceed based on these tool results.")
-
-        return "\n\n".join(parts), attachments
+        return "\n\n".join(parts)
 
     def _extract_user_content(
         self, msg: dict[str, Any]
@@ -588,6 +432,35 @@ class ClaudeWebProvider(LLMProvider):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    _RATE_LIMIT_RE = re.compile(r"HTTP 429.*?resetsAt\\*[\":]+(\\?\d+)", re.DOTALL)
+
+    @classmethod
+    def _format_error(cls, exc: Exception) -> str:
+        """Format exception into a user-friendly error message.
+
+        Parses claude.ai 429 rate limit errors to extract reset time.
+        """
+        msg = str(exc)
+        match = cls._RATE_LIMIT_RE.search(msg)
+        if match:
+            try:
+                ts_str = match.group(1).replace("\\", "")
+                reset_ts = int(ts_str)
+                reset_dt = datetime.fromtimestamp(reset_ts, tz=timezone.utc)
+                remaining = reset_ts - int(time.time())
+                if remaining > 0:
+                    hours, rem = divmod(remaining, 3600)
+                    minutes = rem // 60
+                    time_str = f"{hours}h{minutes}m" if hours else f"{minutes}m"
+                    return (
+                        f"Claude Web rate limit exceeded. "
+                        f"Resets at {reset_dt:%Y-%m-%d %H:%M UTC} (in ~{time_str})."
+                    )
+                return "Claude Web rate limit exceeded (should reset soon)."
+            except (ValueError, OSError):
+                pass
+        return f"Error calling Claude Web: {exc}"
 
     _TOOL_XML_RE = re.compile(
         r"<tool_(?:response|call)\b[^>]*>[\s\S]*?</tool_(?:response|call)>",

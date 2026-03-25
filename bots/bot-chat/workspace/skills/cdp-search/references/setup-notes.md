@@ -54,12 +54,12 @@ If zhihu returns "未搜索到相关内容", it means the tab lost its session �
 
 ### Login Procedure
 
-Cookies were extracted from Chrome CDP using `Network.getCookies` for `.xiaohongshu.com` domain,
-then converted to go-rod `proto.NetworkCookieParam` format (camelCase field names: `name`, `value`, `domain`, `path`, `expires`, `httpOnly`, `secure`, `sameSite`).
+Cookies are extracted from Chrome CDP using `Network.getCookies` for `.xiaohongshu.com` domain,
+then converted to camelCase go-rod format (`name`, `value`, `domain`, `path`, `expires`, `httpOnly`, `secure`, `sameSite`).
 
-QR code login via `get_login_qrcode` has ~30s expiry — too fast for practical use.
+The binary also accepts `XHS_COOKIES_PATH` env var or `--cookies <path>` flag.
 
-### Cookie Format (go-rod proto.NetworkCookieParam)
+### Cookie Format (camelCase go-rod)
 
 ```json
 [
