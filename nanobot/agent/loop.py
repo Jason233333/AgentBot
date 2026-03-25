@@ -417,8 +417,17 @@ class AgentLoop:
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
+                        content="", metadata=msg.metadata or {},
                     ))
+            except asyncio.CancelledError:
+                logger.info("Task cancelled for session {}", msg.session_key)
+                raise
+            except Exception:
+                logger.exception("Error processing message for session {}", msg.session_key)
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Sorry, I encountered an error.",
+                ))
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""

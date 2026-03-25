@@ -452,6 +452,8 @@ def _make_api_provider(config: Config):
             spec=spec,
         )
 
+    return provider
+
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider based on mode config.
