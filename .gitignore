@@ -25,3 +25,5 @@ utils_repo
 .nanobot/
 **/config.json
 **/sessions/
+.DS_Store
+uv.lock
