@@ -179,20 +179,21 @@ class ClaudeWebClient:
         # Map model names to claude.ai model identifiers
         web_model = self._map_model(model)
 
+        conv_uuid = str(uuid.uuid4())
         result = await self._page.evaluate(
-            """async ([orgId, model]) => {
+            """async ([orgId, model, convUuid]) => {
                 const resp = await fetch(
                     `https://claude.ai/api/organizations/${orgId}/chat_conversations`,
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ uuid: crypto.randomUUID(), name: '', model }),
+                        body: JSON.stringify({ uuid: convUuid, name: '', model }),
                     }
                 );
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
                 return await resp.json();
             }""",
-            [org_id, web_model],
+            [org_id, web_model, conv_uuid],
         )
 
         conv_id = result.get("uuid", "")
