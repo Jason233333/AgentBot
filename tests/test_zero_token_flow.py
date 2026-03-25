@@ -601,3 +601,77 @@ class TestMessageConversion:
         # System prompt always included in stateless mode
         assert "Sys." in prompt
         assert "[User]: Do stuff" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Streaming tests
+# ---------------------------------------------------------------------------
+
+
+def _mock_client_streaming(provider: ClaudeWebProvider, chunks: list[str]) -> None:
+    """Patch the client to simulate streaming via send_message_stream."""
+    provider._client.create_conversation = AsyncMock(return_value="conv-stream")
+    provider._client.ensure_browser = AsyncMock()
+
+    async def _fake_stream(conversation_id, prompt, model, attachments, on_delta):
+        full = ""
+        for chunk in chunks:
+            await on_delta(chunk)
+            full += chunk
+        return full
+
+    provider._client.send_message_stream = _fake_stream
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_calls_on_content_delta(provider):
+    """chat_stream delivers each SSE chunk via on_content_delta before returning."""
+    _mock_client_streaming(provider, ["Hello", ", world", "!"])
+
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Say hello"},
+    ]
+    received: list[str] = []
+    resp = await provider.chat_stream(messages, on_content_delta=lambda d: received.append(d))
+
+    assert received == ["Hello", ", world", "!"]
+    assert resp.content == "Hello, world!"
+    assert resp.finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_returns_same_response_as_chat(provider):
+    """chat_stream returns equivalent LLMResponse to chat() for same input."""
+    text = "The answer is 42."
+    _mock_client(provider, text)
+    _mock_client_streaming(provider, [text])
+
+    messages = [{"role": "user", "content": "What is the answer?"}]
+
+    resp_stream = await provider.chat_stream(messages)
+    resp_chat = await provider.chat(messages)
+
+    assert resp_stream.content == resp_chat.content
+    assert resp_stream.finish_reason == resp_chat.finish_reason
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_tool_call_delivered_as_complete_response(provider):
+    """Streaming a tool-call response delivers full XML via on_content_delta chunks."""
+    chunks = [
+        "I'll check the weather!\n",
+        '<tool_call id="c1" name="get_weather">',
+        '{"city": "Tokyo"}',
+        "</tool_call>",
+    ]
+    _mock_client_streaming(provider, chunks)
+
+    messages = [{"role": "user", "content": "Weather in Tokyo?"}]
+    received: list[str] = []
+    resp = await provider.chat_stream(messages, on_content_delta=lambda d: received.append(d))
+
+    assert received == chunks
+    assert resp.finish_reason == "tool_calls"
+    assert len(resp.tool_calls) == 1
+    assert resp.tool_calls[0].name == "get_weather"

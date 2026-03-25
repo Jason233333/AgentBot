@@ -43,6 +43,9 @@ class ClaudeWebClient:
         self._browser: Any | None = None
         self._page: Any | None = None
         self._connected = False
+        # Streaming bridge: request_id → Queue of deltas (None = sentinel/end)
+        self._pending_streams: dict[str, asyncio.Queue[str | None]] = {}
+        self._stream_bridge_registered = False
 
     async def ensure_browser(self) -> None:
         """Ensure browser connection is alive and on claude.ai domain.
@@ -141,6 +144,7 @@ class ClaudeWebClient:
             }])
 
         self._connected = True
+        self._stream_bridge_registered = False  # reset on new page
         logger.info("Connected to Chrome via CDP at {}", self._config.chrome_cdp_url)
 
     async def get_organization_id(self) -> str:
@@ -315,6 +319,145 @@ class ClaudeWebClient:
             )
 
         return result or ""
+
+    async def _setup_streaming_bridge(self) -> None:
+        """Expose _nanobotStreamDelta to JS once per page (idempotent)."""
+        if self._stream_bridge_registered:
+            return
+
+        async def _on_delta(request_id: str, delta: str | None) -> None:
+            q = self._pending_streams.get(request_id)
+            if q is not None:
+                await q.put(delta)
+
+        try:
+            await self._page.expose_function("_nanobotStreamDelta", _on_delta)
+            self._stream_bridge_registered = True
+        except Exception as exc:
+            # Already registered (e.g. after hot-reload) — ignore
+            logger.debug("Streaming bridge already registered: {}", exc)
+            self._stream_bridge_registered = True
+
+    async def send_message_stream(
+        self,
+        conversation_id: str,
+        prompt: str,
+        model: str = "claude-sonnet-4-6",
+        attachments: list[dict[str, Any]] | None = None,
+        on_delta: Any | None = None,
+    ) -> str:
+        """Send a message and stream response chunks via on_delta callback.
+
+        Each SSE chunk calls on_delta(text) as it arrives.
+        Returns the full concatenated response text.
+        """
+        await self.ensure_browser()
+        await self._setup_streaming_bridge()
+
+        org_id = await self.get_organization_id()
+        web_model = self._map_model(model)
+        request_id = str(uuid.uuid4())[:12]
+
+        payload = {
+            "prompt": prompt,
+            "timezone": "Asia/Shanghai",
+            "model": web_model,
+            "attachments": attachments or [],
+        }
+
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._pending_streams[request_id] = queue
+
+        _SSE_TIMEOUT_MS = 300_000
+
+        # Run the SSE fetch in JS; each chunk calls _nanobotStreamDelta(requestId, text)
+        # and signals completion with _nanobotStreamDelta(requestId, null).
+        _STREAMING_JS = """
+async ([orgId, convId, payload, reqId, timeoutMs]) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const resp = await fetch(
+            `https://claude.ai/api/organizations/${orgId}/chat_conversations/${convId}/completion`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                signal: controller.signal,
+            }
+        );
+        if (!resp.ok) {
+            const errText = await resp.text();
+            await _nanobotStreamDelta(reqId, null);
+            throw new Error(`HTTP ${resp.status}: ${errText}`);
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    let delta = null;
+                    if (data.type === 'completion' && data.completion) {
+                        delta = data.completion;
+                    } else if (data.type === 'content_block_delta' && data.delta?.text) {
+                        delta = data.delta.text;
+                    } else if (data.type === 'error') {
+                        await _nanobotStreamDelta(reqId, null);
+                        throw new Error('SSE error: ' + JSON.stringify(data.error || data));
+                    }
+                    if (delta !== null) {
+                        await _nanobotStreamDelta(reqId, delta);
+                    }
+                } catch (e) {
+                    if (e.message && e.message.startsWith('SSE error')) throw e;
+                }
+            }
+        }
+        await _nanobotStreamDelta(reqId, null);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+"""
+
+        try:
+            js_task = asyncio.create_task(
+                asyncio.wait_for(
+                    self._page.evaluate(_STREAMING_JS, [org_id, conversation_id, payload, request_id, _SSE_TIMEOUT_MS]),
+                    timeout=_SSE_TIMEOUT_MS / 1000 + 10,
+                )
+            )
+
+            full_text = ""
+            while True:
+                try:
+                    delta = await asyncio.wait_for(queue.get(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    js_task.cancel()
+                    raise TimeoutError("No SSE chunk received for 60s")
+                if delta is None:
+                    break
+                full_text += delta
+                if on_delta:
+                    await on_delta(delta)
+
+            await js_task
+            return full_text
+
+        finally:
+            self._pending_streams.pop(request_id, None)
 
     async def close(self) -> None:
         """Close browser connection."""

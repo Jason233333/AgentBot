@@ -13,10 +13,12 @@ round-trips efficient.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -90,6 +92,57 @@ class ClaudeWebProvider(LLMProvider):
         elif not key:
             self._conversations.clear()
             logger.debug("[zero-token] cleared all conversations")
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Stream a response via Claude Web, calling on_content_delta for each chunk."""
+        model = model or self._default_model
+        session_key = kwargs.get("session_key", self._get_session_key(messages))
+
+        try:
+            is_continuation = (
+                messages
+                and messages[-1].get("role") == "tool"
+                and session_key in self._conversations
+            )
+
+            if is_continuation:
+                conv_id = self._conversations[session_key]
+                prompt = self._convert_continuation(messages)
+                attachments: list[dict[str, Any]] = []
+            else:
+                conv_id = await self._client.create_conversation(model)
+                self._conversations[session_key] = conv_id
+                prompt, attachments = self._convert_messages(messages, tools)
+
+            async def _on_delta(delta: str) -> None:
+                if on_content_delta:
+                    result = on_content_delta(delta)
+                    if asyncio.iscoroutine(result):
+                        await result
+
+            response_text = await self._client.send_message_stream(
+                conversation_id=conv_id,
+                prompt=prompt,
+                model=model,
+                attachments=attachments,
+                on_delta=_on_delta,
+            )
+            return self._parse_response(response_text)
+        except Exception as exc:
+            logger.exception("Claude Web stream request failed")
+            self._conversations.pop(session_key, None)
+            return LLMResponse(content=self._format_error(exc), finish_reason="error")
 
     async def chat(
         self,
