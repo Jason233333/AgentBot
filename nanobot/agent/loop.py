@@ -184,6 +184,7 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        session_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop."""
         messages = initial_messages
@@ -196,10 +197,14 @@ class AgentLoop:
 
             tool_defs = self.tools.get_definitions()
 
+            chat_kwargs: dict[str, Any] = {}
+            if session_key:
+                chat_kwargs["session_key"] = session_key
             response = await self.provider.chat_with_retry(
                 messages=messages,
                 tools=tool_defs,
                 model=self.model,
+                **chat_kwargs,
             )
 
             if response.recovered_from_error:
@@ -386,7 +391,9 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages, session_key=key,
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
@@ -420,6 +427,9 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            # Clear zero-token conversation mapping for this session
+            if hasattr(self.provider, "clear_session"):
+                self.provider.clear_session(key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -458,6 +468,7 @@ class AgentLoop:
 
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
+            session_key=key,
         )
 
         if final_content is None:

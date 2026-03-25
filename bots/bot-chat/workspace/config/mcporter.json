@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "xiaohongshu": {
+      "baseUrl": "http://localhost:18060/mcp"
+    },
+    "browser": {
+      "baseUrl": "http://localhost:19222/mcp"
+    }
+  },
+  "imports": []
+}

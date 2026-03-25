@@ -20,8 +20,172 @@
 
 ## Jason-DEV
 
-当前仓库的 jason-dev 分支。
+`jason_dev` 分支包含实验性功能，主要是 **Zero-Token Mode（零 Token 模式）**。
 
+### Zero-Token Mode
+
+Zero-Token Mode 通过 Playwright 浏览器自动化连接 claude.ai Web 界面，**无需 API Key 即可使用 Claude**。适合个人使用、开发调试等场景。
+
+#### 1. 启动 Chrome 调试服务
+
+Zero-token 模式需要一个开启了 CDP（Chrome DevTools Protocol）远程调试端口的 Chrome 实例。
+
+**macOS：**
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --remote-allow-origins='*' \
+  --user-data-dir=/tmp/chrome-debug-profile
+```
+
+**Linux：**
+```bash
+google-chrome \
+  --remote-debugging-port=9222 \
+  --remote-allow-origins='*' \
+  --user-data-dir=/tmp/chrome-debug-profile
+```
+
+**Windows：**
+```powershell
+"C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 `
+  --remote-allow-origins='*' `
+  --user-data-dir="$env:TEMP\chrome-debug-profile"
+```
+
+> - `--remote-allow-origins='*'` 允许 Playwright CDP 连接，不加会被拒绝
+> - `--user-data-dir` 指定独立的用户数据目录，避免和日常浏览器冲突
+> - 首次启动后在该 Chrome 中登录 [claude.ai](https://claude.ai)，保持至少一个 claude.ai 标签页打开
+
+验证 Chrome 调试端口可用：
+```bash
+curl -s http://127.0.0.1:9222/json/version | python -m json.tool
+```
+
+#### 2. 安装依赖
+
+```bash
+# 安装 nanobot 及 zero-token 额外依赖
+pip install -e ".[zero-token]"
+
+# 安装 Playwright 浏览器驱动
+playwright install chromium
+```
+
+#### 3. 登录 claude.ai
+
+通过交互式命令登录并保存凭证（会自动从 Chrome 中提取 session）：
+
+```bash
+nanobot provider login claude-web
+```
+
+成功后会显示：
+```
+✓ Authenticated with Claude Web
+Credentials saved to ~/.nanobot/credentials/claude-web.json
+```
+
+> 如果你已在 Chrome 中登录了 claude.ai，这步可以跳过 — provider 会直接复用 Chrome 的登录态。
+
+#### 4. 配置
+
+复制示例配置并修改：
+
+```bash
+cp bots/bot-chat/config.json.example bots/bot-chat/config.json
+```
+
+**必须修改的配置项：**
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "mode": "zero",
+      "maxToolIterations": 200
+    }
+  },
+  "channels": {
+    "discord": {
+      "enabled": true,
+      "token": "你的 Discord Bot Token",
+      "allowFrom": ["你的 Discord User ID"]
+    }
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `mode` | 设为 `"zero"` 启用 zero-token 模式 |
+| `model` | 支持 `claude-sonnet-4-6`、`claude-opus-4-6`、`claude-haiku-4-5` 等 |
+| `maxToolIterations` | 工具调用上限，建议 `200`（默认 40 可能不够） |
+| `channels.*.token` | 你要使用的聊天平台的 Bot Token |
+| `channels.*.allowFrom` | 允许与 bot 对话的用户 ID 白名单 |
+
+> 也可以同时配置 `providers.anthropic.apiKey`，这样 API 模式作为 fallback 可用。
+
+#### 5. 启动 nanobot
+
+```bash
+# 在项目根目录下运行
+python -m nanobot gateway \
+  --config /path/to/AgentBot/bots/bot-chat/config.json \
+  --workspace /path/to/AgentBot/bots/bot-chat/workspace
+```
+
+> 将 `/path/to/AgentBot` 替换为你的实际项目路径。
+
+正常启动后日志会显示：
+```
+[zero-token] Connected to Chrome via CDP at http://127.0.0.1:9222
+```
+
+#### 6. 测试
+
+**单元测试（无需 Chrome）：**
+
+```bash
+# 核心流程测试（mocked browser）
+pytest tests/test_zero_token_flow.py -v
+```
+
+**端到端测试（需要 Chrome 已启动并登录 claude.ai）：**
+
+```bash
+# zero-token provider 直连测试
+python scripts/test_zero_token_e2e.py              # 全部测试
+python scripts/test_zero_token_e2e.py --test chat   # 仅简单对话
+python scripts/test_zero_token_e2e.py --test tool   # 仅工具调用
+python scripts/test_zero_token_e2e.py --test multi  # 仅多轮对话
+
+# Discord + zero-token 全链路测试（需要 Discord Bot Token）
+NANOBOT_DISCORD_BOT_TOKEN="your_token" \
+DISCORD_TEST_CHANNEL_ID="channel_id" \
+python scripts/test_discord_e2e.py
+```
+
+#### 工作原理
+
+```
+用户消息 → nanobot → Playwright CDP → Chrome → claude.ai Web API → SSE 响应 → 解析 → 回复用户
+```
+
+- **会话管理**：每个聊天会话映射到一个 claude.ai conversation，持久化到磁盘（重启不丢失）
+- **对话轮转**：每 20 轮自动创建新 conversation 并重新注入 system prompt，防止长对话丢失人设
+- **工具支持**：通过 XML 格式注入工具定义，支持文件读写、命令执行、Web 搜索等全部工具
+- **子 Agent**：支持派生子 agent 执行后台任务，每个子 agent 使用独立的 conversation
+- **故障恢复**：conversation 失败时自动重建，带完整历史上下文
+
+#### 已知限制
+
+- 依赖 Chrome 浏览器持续运行，不适合无头服务器部署
+- claude.ai 有使用频率限制，高频调用可能触发限流
+- 不支持接收 claude.ai 生成的图片（文本响应正常）
+- 对话过长时 claude.ai 可能截断早期内容（已通过对话轮转缓解）
 
 
 

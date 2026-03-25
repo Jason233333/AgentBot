@@ -168,10 +168,11 @@ class LLMProvider(ABC):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """
         Send a chat completion request.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
@@ -179,7 +180,8 @@ class LLMProvider(ABC):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             tool_choice: Tool selection strategy ("auto", "required", or specific tool dict).
-        
+            **kwargs: Provider-specific options (e.g. session_key for zero-token).
+
         Returns:
             LLMResponse with content and/or tool calls.
         """
@@ -199,12 +201,15 @@ class LLMProvider(ABC):
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures.
 
         Parameters default to ``self.generation`` when not explicitly passed,
         so callers no longer need to thread temperature / max_tokens /
         reasoning_effort through every layer.
+
+        Extra **kwargs are forwarded to chat() (e.g. session_key for zero-token).
         """
         if max_tokens is self._SENTINEL:
             max_tokens = self.generation.max_tokens
@@ -223,6 +228,7 @@ class LLMProvider(ABC):
                     temperature=temperature,
                     reasoning_effort=reasoning_effort,
                     tool_choice=tool_choice,
+                    **kwargs,
                 )
             except asyncio.CancelledError:
                 raise
@@ -258,6 +264,7 @@ class LLMProvider(ABC):
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 tool_choice=tool_choice,
+                **kwargs,
             )
             if response.finish_reason != "error":
                 response.recovered_from_error = True

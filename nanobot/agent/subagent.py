@@ -53,6 +53,7 @@ class SubagentManager:
         self.restrict_to_workspace = restrict_to_workspace
         self.max_concurrent = max_concurrent
         self.timeout_s = timeout_s
+        self.max_iterations = 30  # per-subagent tool call iterations
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -128,6 +129,10 @@ class SubagentManager:
             logger.error(
                 "Subagent [{}] timed out after {}s", task_id, self.timeout_s
             )
+            # Clean up conversation mapping on timeout
+            sub_key = f"subagent:{task_id}"
+            if hasattr(self.provider, "clear_session"):
+                self.provider.clear_session(sub_key)
             await self._announce_result(
                 task_id,
                 label,
@@ -138,6 +143,9 @@ class SubagentManager:
             )
         except asyncio.CancelledError:
             logger.info("Subagent [{}] was cancelled", task_id)
+            sub_key = f"subagent:{task_id}"
+            if hasattr(self.provider, "clear_session"):
+                self.provider.clear_session(sub_key)
             raise
 
     async def _run_subagent_inner(
@@ -146,6 +154,7 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        session_key: str | None = None,
     ) -> None:
         """Inner implementation of subagent execution (called inside wait_for)."""
         try:
@@ -171,18 +180,23 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
 
-            # Run agent loop (limited iterations)
-            max_iterations = 15
+            # Run agent loop
+            # Use a dedicated session_key so zero-token provider creates a
+            # separate conversation for this subagent.
+            sub_session_key = session_key or f"subagent:{task_id}"
+            chat_kwargs: dict[str, Any] = {"session_key": sub_session_key}
+
             iteration = 0
             final_result: str | None = None
 
-            while iteration < max_iterations:
+            while iteration < self.max_iterations:
                 iteration += 1
 
                 response = await self.provider.chat_with_retry(
                     messages=messages,
                     tools=tools.get_definitions(),
                     model=self.model,
+                    **chat_kwargs,
                 )
 
                 if response.has_tool_calls:
@@ -222,6 +236,10 @@ class SubagentManager:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
+        finally:
+            # Clean up zero-token conversation mapping for this subagent
+            if hasattr(self.provider, "clear_session"):
+                self.provider.clear_session(sub_session_key)
 
     async def _announce_result(
         self,
