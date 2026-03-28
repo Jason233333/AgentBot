@@ -37,6 +37,10 @@ class AgentDefaults(Base):
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
     mode: Literal["normal", "zero", "normal-zero"] = "normal"  # LLM routing mode
+    zero_providers: list[str] = Field(
+        default_factory=lambda: ["claude"],
+        description="Ordered list of zero-token providers to try. Options: 'claude', 'gpt', 'gemini'.",
+    )
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
     temperature: float = 0.1
@@ -88,6 +92,8 @@ class ProvidersConfig(Base):
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
     claude_web: "ClaudeWebConfig" = Field(default_factory=lambda: ClaudeWebConfig())  # Claude Web (zero-token)
+    chatgpt_web: "ChatGPTWebConfig" = Field(default_factory=lambda: ChatGPTWebConfig())  # ChatGPT Web (zero-token)
+    gemini_web: "GeminiWebConfig" = Field(default_factory=lambda: GeminiWebConfig())  # Gemini Web (zero-token)
 
 
 class ClaudeWebConfig(Base):
@@ -99,6 +105,25 @@ class ClaudeWebConfig(Base):
     organization_id: str = ""
     chrome_cdp_url: str = "http://127.0.0.1:9222"
     attach_only: bool = True  # True=attach to existing Chrome, False=launch new
+
+
+class ChatGPTWebConfig(Base):
+    """ChatGPT Web (zero-token) provider configuration."""
+
+    access_token: str = ""  # __Secure-next-auth.session-token value
+    cookie: str = ""        # full cookie string (alternative to access_token)
+    user_agent: str = ""
+    chrome_cdp_url: str = "http://127.0.0.1:9222"
+    attach_only: bool = True
+
+
+class GeminiWebConfig(Base):
+    """Gemini Web (zero-token) provider configuration."""
+
+    cookie: str = ""        # Google account cookies
+    user_agent: str = ""
+    chrome_cdp_url: str = "http://127.0.0.1:9222"
+    attach_only: bool = True
 
 
 class HeartbeatConfig(Base):
