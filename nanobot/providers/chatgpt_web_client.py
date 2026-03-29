@@ -13,7 +13,6 @@ Two request paths:
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -379,13 +378,13 @@ async ([message, reqId, maxWaitMs, pollIntervalMs]) => {
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._pending_streams[request_id] = queue
 
-        _SSE_TIMEOUT_MS = 300_000
+        sse_timeout_ms = 300_000
 
         try:
             js_task = asyncio.create_task(
                 asyncio.wait_for(
-                    self._page.evaluate(self._SENTINEL_FETCH_JS, [body, request_id, _SSE_TIMEOUT_MS]),
-                    timeout=_SSE_TIMEOUT_MS / 1000 + 10,
+                    self._page.evaluate(self._SENTINEL_FETCH_JS, [body, request_id, sse_timeout_ms]),
+                    timeout=sse_timeout_ms / 1000 + 10,
                 )
             )
 

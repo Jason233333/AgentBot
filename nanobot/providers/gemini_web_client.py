@@ -265,17 +265,17 @@ async ([message, reqId, maxWaitMs, pollIntervalMs]) => {
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._pending_streams[request_id] = queue
 
-        _MAX_WAIT_MS = 120_000
-        _POLL_INTERVAL_MS = 2_000
+        max_wait_ms = 120_000
+        poll_interval_ms = 2_000
 
         try:
             js_task = asyncio.create_task(
                 asyncio.wait_for(
                     self._page.evaluate(
                         self._DOM_SEND_AND_POLL_JS,
-                        [prompt, request_id, _MAX_WAIT_MS, _POLL_INTERVAL_MS],
+                        [prompt, request_id, max_wait_ms, poll_interval_ms],
                     ),
-                    timeout=_MAX_WAIT_MS / 1000 + 10,
+                    timeout=max_wait_ms / 1000 + 10,
                 )
             )
 
@@ -283,7 +283,7 @@ async ([message, reqId, maxWaitMs, pollIntervalMs]) => {
             while True:
                 try:
                     delta = await asyncio.wait_for(
-                        queue.get(), timeout=_MAX_WAIT_MS / 1000 + 15
+                        queue.get(), timeout=max_wait_ms / 1000 + 15
                     )
                 except asyncio.TimeoutError:
                     js_task.cancel()

@@ -395,6 +395,73 @@ def _make_claude_web_provider(config: Config):
     )
 
 
+def _make_chatgpt_web_provider(config: Config):
+    """Create a ChatGPTWebProvider from config."""
+    from nanobot.providers.chatgpt_web_provider import ChatGPTWebProvider
+
+    cw = config.providers.chatgpt_web
+    return ChatGPTWebProvider(
+        access_token=cw.access_token,
+        cookie=cw.cookie,
+        user_agent=cw.user_agent,
+        chrome_cdp_url=cw.chrome_cdp_url,
+        attach_only=cw.attach_only,
+        default_model=config.agents.defaults.model,
+    )
+
+
+def _make_gemini_web_provider(config: Config):
+    """Create a GeminiWebProvider from config."""
+    from nanobot.providers.gemini_web_provider import GeminiWebProvider
+
+    gw = config.providers.gemini_web
+    return GeminiWebProvider(
+        cookie=gw.cookie,
+        user_agent=gw.user_agent,
+        chrome_cdp_url=gw.chrome_cdp_url,
+        attach_only=gw.attach_only,
+        default_model=config.agents.defaults.model,
+    )
+
+
+def _make_zero_token_chain(config: Config):
+    """Build a ProviderChain from config.agents.defaults.zero_providers order.
+
+    Supported provider names: "claude", "gpt", "gemini".
+    Unknown names are skipped with a warning.
+    """
+    from loguru import logger
+    from nanobot.providers.fallback_provider import ProviderChain
+
+    factories = {
+        "claude": _make_claude_web_provider,
+        "gpt": _make_chatgpt_web_provider,
+        "gemini": _make_gemini_web_provider,
+    }
+
+    zero_providers = config.agents.defaults.zero_providers or ["claude"]
+    providers = []
+    for name in zero_providers:
+        factory = factories.get(name)
+        if factory is None:
+            logger.warning("Unknown zero_providers entry '{}', skipping", name)
+            continue
+        try:
+            providers.append(factory(config))
+        except Exception as exc:
+            logger.warning("Failed to create '{}' zero-token provider: {}", name, exc)
+
+    if not providers:
+        raise RuntimeError(
+            "No zero-token providers could be initialized. "
+            "Check providers.claude_web / chatgpt_web / gemini_web config."
+        )
+
+    if len(providers) == 1:
+        return providers[0]
+    return ProviderChain(providers=providers)
+
+
 def _make_api_provider(config: Config):
     """Create the standard API-based LLM provider from config.
 
@@ -469,14 +536,16 @@ def _make_provider(config: Config):
     defaults = config.agents.defaults
 
     if mode == "zero":
-        provider = _make_claude_web_provider(config)
-        console.print("[cyan]Mode: zero-token (Claude Web)[/cyan]")
+        provider = _make_zero_token_chain(config)
+        names = " → ".join(config.agents.defaults.zero_providers or ["claude"])
+        console.print(f"[cyan]Mode: zero-token ({names})[/cyan]")
     elif mode == "normal-zero":
-        from nanobot.providers.fallback_provider import FallbackProvider
+        from nanobot.providers.fallback_provider import ProviderChain
         primary = _make_api_provider(config)
-        secondary = _make_claude_web_provider(config)
-        provider = FallbackProvider(primary=primary, secondary=secondary)
-        console.print("[cyan]Mode: normal-zero (API → Claude Web fallback)[/cyan]")
+        zero_chain = _make_zero_token_chain(config)
+        provider = ProviderChain(providers=[primary, zero_chain])
+        names = " → ".join(config.agents.defaults.zero_providers or ["claude"])
+        console.print(f"[cyan]Mode: normal-zero (API → {names})[/cyan]")
     else:
         provider = _make_api_provider(config)
 
