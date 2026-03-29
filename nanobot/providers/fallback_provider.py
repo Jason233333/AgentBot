@@ -87,3 +87,74 @@ class FallbackProvider(LLMProvider):
                 content=f"Both providers failed. Secondary error: {exc}",
                 finish_reason="error",
             )
+
+
+class ProviderChain(LLMProvider):
+    """Composite provider: tries each provider in order, falling back on failure.
+
+    Each call tries providers[0], then providers[1], ..., until one succeeds
+    (finish_reason != "error") or all are exhausted. The fallback is per-call.
+    """
+
+    def __init__(self, providers: list[LLMProvider]) -> None:
+        super().__init__()
+        if not providers:
+            raise ValueError("ProviderChain requires at least one provider")
+        self._providers = providers
+
+    def get_default_model(self) -> str:
+        return self._providers[0].get_default_model()
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Try each provider in order, return first success."""
+        last_response: LLMResponse | None = None
+
+        for i, provider in enumerate(self._providers):
+            try:
+                response = await provider.chat(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    tool_choice=tool_choice,
+                    **kwargs,
+                )
+                if response.finish_reason != "error":
+                    if i > 0:
+                        response.recovered_from_error = True
+                    return response
+
+                logger.warning(
+                    "Provider #{} ({}) returned error, trying next: {}",
+                    i, type(provider).__name__,
+                    (response.content or "")[:120],
+                )
+                last_response = response
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Provider #{} ({}) raised {}, trying next",
+                    i, type(provider).__name__, exc,
+                )
+                last_response = LLMResponse(
+                    content=f"Error from {type(provider).__name__}: {exc}",
+                    finish_reason="error",
+                )
+
+        logger.error("All {} providers in chain failed", len(self._providers))
+        return last_response or LLMResponse(
+            content="All providers in chain failed", finish_reason="error"
+        )

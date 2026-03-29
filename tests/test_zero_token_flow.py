@@ -675,3 +675,79 @@ async def test_chat_stream_tool_call_delivered_as_complete_response(provider):
     assert resp.finish_reason == "tool_calls"
     assert len(resp.tool_calls) == 1
     assert resp.tool_calls[0].name == "get_weather"
+
+
+# ---------------------------------------------------------------------------
+# 10. ProviderChain (N-provider fallback)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provider_chain_tries_in_order():
+    """ProviderChain: first provider fails -> second fails -> third succeeds."""
+    from nanobot.providers.fallback_provider import ProviderChain
+
+    def make_failing(msg):
+        p = AsyncMock(spec=["chat", "get_default_model", "generation"])
+        p.chat = AsyncMock(return_value=LLMResponse(content=msg, finish_reason="error"))
+        p.get_default_model = MagicMock(return_value="model")
+        p.generation = MagicMock()
+        return p
+
+    def make_success(msg):
+        p = AsyncMock(spec=["chat", "get_default_model", "generation"])
+        p.chat = AsyncMock(return_value=LLMResponse(content=msg, finish_reason="stop"))
+        p.get_default_model = MagicMock(return_value="model")
+        p.generation = MagicMock()
+        return p
+
+    p1 = make_failing("error from p1")
+    p2 = make_failing("error from p2")
+    p3 = make_success("success from p3")
+
+    chain = ProviderChain(providers=[p1, p2, p3])
+    resp = await chain.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert resp.content == "success from p3"
+    assert resp.recovered_from_error is True
+    p1.chat.assert_awaited_once()
+    p2.chat.assert_awaited_once()
+    p3.chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_provider_chain_all_fail():
+    """ProviderChain: all fail -> returns last error response."""
+    from nanobot.providers.fallback_provider import ProviderChain
+
+    def make_failing(msg):
+        p = AsyncMock(spec=["chat", "get_default_model", "generation"])
+        p.chat = AsyncMock(return_value=LLMResponse(content=msg, finish_reason="error"))
+        p.get_default_model = MagicMock(return_value="model")
+        p.generation = MagicMock()
+        return p
+
+    chain = ProviderChain(providers=[make_failing("e1"), make_failing("e2")])
+    resp = await chain.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert resp.finish_reason == "error"
+    assert "e2" in (resp.content or "")
+
+
+@pytest.mark.asyncio
+async def test_provider_chain_first_succeeds():
+    """ProviderChain: first provider succeeds -> others not called."""
+    from nanobot.providers.fallback_provider import ProviderChain
+
+    p1 = AsyncMock(spec=["chat", "get_default_model", "generation"])
+    p1.chat = AsyncMock(return_value=LLMResponse(content="ok", finish_reason="stop"))
+    p1.get_default_model = MagicMock(return_value="model")
+    p1.generation = MagicMock()
+    p2 = AsyncMock(spec=["chat", "get_default_model", "generation"])
+    p2.chat = AsyncMock()
+
+    chain = ProviderChain(providers=[p1, p2])
+    resp = await chain.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert resp.content == "ok"
+    p2.chat.assert_not_awaited()
