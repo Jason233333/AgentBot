@@ -121,11 +121,16 @@ class ChatGPTWebProvider(LLMProvider):
                 on_delta=_on_delta,
             )
 
-            # Update conversation tracking
-            self._conversations[session_key] = {
-                "conv_id": new_conv_id or conv_id,
-                "parent_msg_id": new_parent_id or parent_msg_id,
-            }
+            # Update conversation tracking.
+            # When both IDs are absent the client used DOM fallback — clear session
+            # so the next call always rebuilds the full prompt with complete context.
+            if new_conv_id or new_parent_id:
+                self._conversations[session_key] = {
+                    "conv_id": new_conv_id or conv_id,
+                    "parent_msg_id": new_parent_id or parent_msg_id,
+                }
+            else:
+                self._conversations.pop(session_key, None)
 
             return self._parse_response(full_text)
         except Exception as exc:
@@ -178,10 +183,13 @@ class ChatGPTWebProvider(LLMProvider):
                 parent_message_id=parent_msg_id,
             )
 
-            self._conversations[session_key] = {
-                "conv_id": new_conv_id or conv_id,
-                "parent_msg_id": new_parent_id or parent_msg_id,
-            }
+            if new_conv_id or new_parent_id:
+                self._conversations[session_key] = {
+                    "conv_id": new_conv_id or conv_id,
+                    "parent_msg_id": new_parent_id or parent_msg_id,
+                }
+            else:
+                self._conversations.pop(session_key, None)
 
             return self._parse_response(response_text)
         except Exception as exc:

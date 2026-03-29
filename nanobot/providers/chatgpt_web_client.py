@@ -277,53 +277,55 @@ async ([body, reqId, timeoutMs]) => {
 }
 """
 
-    _DOM_FALLBACK_JS = r"""
-async ([message, reqId, maxWaitMs, pollIntervalMs]) => {
-    const inputSelectors = ['#prompt-textarea', 'textarea[placeholder]', 'textarea',
-        '[contenteditable="true"][data-placeholder]', "[contenteditable='true']"];
-    let inputEl = null;
-    for (const sel of inputSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.offsetParent !== null) { inputEl = el; break; }
-    }
-    if (!inputEl) { throw new Error('ChatGPT DOM: input element not found'); }
-    inputEl.focus();
-    if (inputEl.tagName === 'TEXTAREA' || inputEl.tagName === 'INPUT') {
-        inputEl.value = message;
-        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-    } else {
-        inputEl.textContent = message;
-        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-    const sendSelectors = ['#composer-submit-button', 'button[data-testid="send-button"]',
-        'button.btn.relative.btn-primary', 'button[aria-label*="Send"]', 'button[type="submit"]',
-        'form button[type=submit]'];
-    let sendBtn = null;
-    for (const sel of sendSelectors) {
-        const btn = document.querySelector(sel);
-        if (btn && !btn.disabled) { sendBtn = btn; break; }
-    }
-    if (!sendBtn) { throw new Error('ChatGPT DOM: send button not found'); }
-    sendBtn.click();
+    # Poll-only JS: called after input+send are handled by Playwright native APIs.
+    _DOM_POLL_JS = r"""
+async ([reqId, maxWaitMs, pollIntervalMs]) => {
+    const clean = t => t.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    // Multiple selectors to handle ChatGPT DOM variations across versions
+    const responseSelectors = [
+        '[data-message-author-role="assistant"]',
+        '[data-message-role="assistant"]',
+        'article[data-testid*="conversation-turn"]:not([data-message-author-role="user"])',
+        '.agent-turn',
+        '[class*="agent-turn"]',
+    ];
+
+    const getLatestText = () => {
+        for (const sel of responseSelectors) {
+            const els = document.querySelectorAll(sel);
+            for (let i = els.length - 1; i >= 0; i--) {
+                const t = clean(els[i].textContent || '');
+                if (t.length > 5) return t;
+            }
+        }
+        return '';
+    };
 
     let lastText = '';
     let stableCount = 0;
+    let lastEmitted = '';
     for (let elapsed = 0; elapsed < maxWaitMs; elapsed += pollIntervalMs) {
         await new Promise(r => setTimeout(r, pollIntervalMs));
-        const els = document.querySelectorAll('[data-message-author-role="assistant"]');
-        const last = els.length > 0 ? els[els.length - 1] : null;
-        const text = last ? (last.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim() : '';
-        const stopBtn = document.querySelector('button.bg-black .icon-lg, [aria-label*="Stop"]');
-        if (text && text !== lastText) { lastText = text; stableCount = 0; }
-        else if (text) {
+        const text = getLatestText();
+        const stopBtn = document.querySelector(
+            '[data-testid="stop-button"], button[aria-label*="Stop generating"]'
+        );
+        if (text && text !== lastText) {
+            const delta = text.slice(lastEmitted.length);
+            if (delta) {
+                await _nanobotGPTStreamDelta(reqId, delta);
+                lastEmitted = text;
+            }
+            lastText = text;
+            stableCount = 0;
+        } else if (text) {
             stableCount++;
-            if (!stopBtn && stableCount >= 2) break;
+            if (!stopBtn && stableCount >= 3) break;
         }
     }
-    if (!lastText) { throw new Error('ChatGPT DOM: no response detected'); }
-    await _nanobotGPTStreamDelta(reqId, lastText);
+    if (!lastText) { throw new Error('ChatGPT DOM: no response detected within timeout'); }
     await _nanobotGPTStreamDelta(reqId, null);
-    return { conversationId: null, parentMessageId: null };
+    return lastText;
 }
 """
 
@@ -416,21 +418,105 @@ async ([message, reqId, maxWaitMs, pollIntervalMs]) => {
                 queue2: asyncio.Queue[str | None] = asyncio.Queue()
                 self._pending_streams[request_id] = queue2
                 try:
+                    # Navigate to a fresh conversation so this DOM request has no
+                    # prior context from the same browser tab.
+                    await self._page.goto(
+                        "https://chatgpt.com/", wait_until="domcontentloaded"
+                    )
+                    await asyncio.sleep(1.5)
+                    # Re-register streaming bridge (persists across navigations but
+                    # flag needs resetting so we confirm it's still live).
+                    self._stream_bridge_registered = False
+                    await self._setup_streaming_bridge()
+
+                    # Step 1: type message via real key events (Lexical requires this)
+                    input_loc = self._page.locator("#prompt-textarea").first
+                    try:
+                        await input_loc.wait_for(state="visible", timeout=5000)
+                    except Exception:
+                        input_loc = self._page.locator(
+                            "div[contenteditable='true']"
+                        ).first
+                        await input_loc.wait_for(state="visible", timeout=5000)
+                    # Click to focus, then type via page.keyboard so Lexical fires events
+                    await input_loc.click()
+                    await asyncio.sleep(0.2)
+                    await self._page.keyboard.type(prompt, delay=10)
+                    await asyncio.sleep(0.8)
+
+                    # Step 2: wait for send button to be enabled, then click
+                    send_sel = (
+                        "button[data-testid='send-button'], "
+                        "#composer-submit-button, "
+                        "button[aria-label='Send prompt']"
+                    )
+                    send_loc = self._page.locator(send_sel).first
+                    # Wait up to 5s for button to become enabled after fill()
+                    await self._page.wait_for_selector(
+                        (
+                            "button[data-testid='send-button']:not([disabled]),"
+                            "button[data-testid='send-button']:not([aria-disabled='true']),"
+                            "#composer-submit-button:not([disabled]),"
+                            "button[aria-label='Send prompt']:not([disabled])"
+                        ),
+                        state="visible",
+                        timeout=5000,
+                    )
+
+                    # Submitting on new-chat page triggers a URL navigation to /c/<id>.
+                    # Use expect_navigation so polling JS starts on the settled page.
+                    url_before = self._page.url
+                    needs_navigation = "/c/" not in url_before
+                    if needs_navigation:
+                        async with self._page.expect_navigation(
+                            wait_until="domcontentloaded", timeout=12000
+                        ):
+                            await send_loc.click()
+                    else:
+                        await send_loc.click()
+                        await asyncio.sleep(0.5)
+
+                    # Re-setup bridge after possible navigation
+                    self._stream_bridge_registered = False
+                    await self._setup_streaming_bridge()
+
+                    # Step 3: poll for response via JS (incremental delta streaming)
                     dom_task = asyncio.create_task(
-                        self._page.evaluate(
-                            self._DOM_FALLBACK_JS,
-                            [prompt, request_id, 90000, 2000],
-                        )
+                        self._page.evaluate(self._DOM_POLL_JS, [request_id, 90000, 2000])
                     )
                     full_text = ""
                     while True:
-                        delta = await asyncio.wait_for(queue2.get(), timeout=120.0)
+                        queue_get = asyncio.create_task(queue2.get())
+                        try:
+                            done, _ = await asyncio.wait(
+                                {queue_get, dom_task},
+                                timeout=120.0,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        except asyncio.CancelledError:
+                            queue_get.cancel()
+                            dom_task.cancel()
+                            raise
+                        if not done:
+                            queue_get.cancel()
+                            dom_task.cancel()
+                            raise TimeoutError("ChatGPT DOM: no response in 120s")
+                        if dom_task in done and not dom_task.cancelled():
+                            task_exc = dom_task.exception()
+                            if task_exc:
+                                queue_get.cancel()
+                                raise task_exc
+                        if not queue_get.done():
+                            queue_get.cancel()
+                            break
+                        delta = queue_get.result()
                         if delta is None:
                             break
                         full_text += delta
                         if on_delta:
                             await on_delta(delta)
-                    await dom_task
+                    if not dom_task.done():
+                        await dom_task
                     return full_text, None, None
                 except Exception as dom_exc:
                     raise RuntimeError(
