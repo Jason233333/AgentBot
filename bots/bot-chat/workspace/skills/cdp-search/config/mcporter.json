@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "xiaohongshu": {
+      "command": "/tmp/xiaohongshu-mcp-darwin-arm64",
+      "args": [],
+      "env": {
+        "XHS_COOKIES_PATH": "/tmp/xhs-data/cookies.json"
+      }
+    }
+  }
+}

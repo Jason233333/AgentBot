@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
+from tempfile import NamedTemporaryFile
 
 try:
     import markdown
@@ -31,6 +32,7 @@ DRAFT_ADD_URL = "https://api.weixin.qq.com/cgi-bin/draft/add"
 PUBLISH_SUBMIT_URL = "https://api.weixin.qq.com/cgi-bin/freepublish/submit"
 PUBLISH_GET_URL = "https://api.weixin.qq.com/cgi-bin/freepublish/get"
 MATERIAL_ADD_URL = "https://api.weixin.qq.com/cgi-bin/material/add_material"
+IMAGE_UPLOAD_URL = "https://api.weixin.qq.com/cgi-bin/media/uploadimg"
 
 
 class WeChatPublishError(RuntimeError):
@@ -484,6 +486,9 @@ def generate_cover_image(title: str, output_path: Path) -> Path | None:
         draw.line([(0, y), (width, y)], fill=(r, g, b))
 
     font_candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
         "C:\\Windows\\Fonts\\msyhbd.ttc",
         "C:\\Windows\\Fonts\\msyh.ttc",
         "C:\\Windows\\Fonts\\simhei.ttf",
@@ -491,8 +496,9 @@ def generate_cover_image(title: str, output_path: Path) -> Path | None:
     font = None
     for c in font_candidates:
         try:
-            font = ImageFont.truetype(c, 56)
-            break
+            if Path(c).exists():
+                font = ImageFont.truetype(c, 56)
+                break
         except Exception:
             continue
     if font is None:
@@ -504,6 +510,52 @@ def generate_cover_image(title: str, output_path: Path) -> Path | None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(output_path, "JPEG", quality=92)
     return output_path
+
+
+def _guess_image_mime(image_path: Path) -> str:
+    suffix = image_path.suffix.lower()
+    return {
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".jpeg": "image/jpeg",
+        ".jpg": "image/jpeg",
+    }.get(suffix, "image/jpeg")
+
+
+def rewrite_remote_images_to_absolute(content_html: str, source_url: str) -> str:
+    if not source_url:
+        return content_html
+    soup = BeautifulSoup(content_html, "html.parser")
+    changed = False
+    for img in soup.find_all("img"):
+        src = (img.get("src") or "").strip()
+        if not src or src.startswith(("data:", "http://", "https://")):
+            continue
+        img["src"] = urljoin(source_url, src)
+        changed = True
+    return str(soup) if changed else content_html
+
+
+def replace_body_images_for_wechat(content_html: str, client: "WeChatClient", token: str) -> tuple[str, list[dict[str, str]]]:
+    soup = BeautifulSoup(content_html, "html.parser")
+    replacements: list[dict[str, str]] = []
+    cache: dict[str, str] = {}
+    for img in soup.find_all("img"):
+        src = (img.get("src") or "").strip()
+        if not src or src.startswith("data:"):
+            continue
+        if src in cache:
+            img["src"] = cache[src]
+            continue
+        try:
+            new_url = client.upload_article_image_from_url(token, src)
+        except Exception:
+            continue
+        cache[src] = new_url
+        img["src"] = new_url
+        replacements.append({"from": src, "to": new_url})
+    return str(soup), replacements
 
 
 class WeChatClient:
@@ -545,7 +597,7 @@ class WeChatClient:
 
     def upload_image_from_path(self, token: str, image_path: Path) -> str:
         with image_path.open("rb") as fh:
-            files = {"media": (image_path.name, fh, "image/jpeg")}
+            files = {"media": (image_path.name, fh, _guess_image_mime(image_path))}
             resp = requests.post(
                 MATERIAL_ADD_URL,
                 params={"access_token": token, "type": "image"},
@@ -561,11 +613,31 @@ class WeChatClient:
             raise WeChatPublishError("upload image failed: missing media_id")
         return media_id
 
+    def upload_article_image_from_path(self, token: str, image_path: Path) -> str:
+        with image_path.open("rb") as fh:
+            files = {"media": (image_path.name, fh, _guess_image_mime(image_path))}
+            resp = requests.post(
+                IMAGE_UPLOAD_URL,
+                params={"access_token": token},
+                files=files,
+                timeout=self.timeout,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("errcode", 0) != 0:
+            raise WeChatPublishError(f"upload article image failed: {data}")
+        image_url = data.get("url", "")
+        if not image_url:
+            raise WeChatPublishError("upload article image failed: missing url")
+        return image_url
+
     def upload_image_from_url(self, token: str, image_url: str) -> str:
         img = requests.get(image_url, timeout=self.timeout)
         img.raise_for_status()
-        content_type = img.headers.get("Content-Type", "image/jpeg")
-        files = {"media": ("thumb.jpg", img.content, content_type)}
+        parsed = urlparse(image_url)
+        filename = Path(parsed.path).name or "thumb.jpg"
+        content_type = img.headers.get("Content-Type") or _guess_image_mime(Path(filename))
+        files = {"media": (filename, img.content, content_type)}
         resp = requests.post(
             MATERIAL_ADD_URL,
             params={"access_token": token, "type": "image"},
@@ -580,6 +652,25 @@ class WeChatClient:
         if not media_id:
             raise WeChatPublishError("upload image url failed: missing media_id")
         return media_id
+
+    def upload_article_image_from_url(self, token: str, image_url: str) -> str:
+        img = requests.get(image_url, timeout=self.timeout)
+        img.raise_for_status()
+        parsed = urlparse(image_url)
+        filename = Path(parsed.path).name or "article-image.jpg"
+        suffix = Path(filename).suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".gif"}:
+            filename = f"{Path(filename).stem or 'article-image'}.jpg"
+        with NamedTemporaryFile(delete=False, suffix=Path(filename).suffix or ".jpg") as tmp:
+            tmp.write(img.content)
+            temp_path = Path(tmp.name)
+        try:
+            return self.upload_article_image_from_path(token, temp_path)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def add_draft(
         self,
@@ -725,6 +816,7 @@ def main() -> None:
             raise RuntimeError(f"文件不存在: {input_path}")
         article = extract_from_markdown(input_path, source_url_override=args.source_url.strip())
 
+    article.content = rewrite_remote_images_to_absolute(article.content, article.source_url)
     article.content = optimize_for_wechat_html(article.content, template=template)
 
     preview_path = Path.cwd() / f"{slugify(article.title)}-wechat-preview.html"
@@ -753,6 +845,9 @@ def main() -> None:
 
     client = WeChatClient(app_id=app_id, app_secret=app_secret, timeout=args.timeout)
     token = client.get_token()
+
+    article.content, image_rewrites = replace_body_images_for_wechat(article.content, client, token)
+    preview_path.write_text(article.content, encoding="utf-8")
 
     thumb_media_id = ""
     auto_generate_cover = True
@@ -793,6 +888,9 @@ def main() -> None:
         "template": template,
         "draft_media_id": draft_media_id,
         "preview_html": str(preview_path),
+        "thumb_media_id": thumb_media_id,
+        "body_image_count": len(image_rewrites),
+        "body_images": image_rewrites,
     }
 
     if args.publish:

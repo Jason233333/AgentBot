@@ -51,6 +51,8 @@ description: 从 Markdown 文件或网页链接提取文章并发布到微信公
 - 发布前优先做 `--dry-run`，检查标题、摘要和渲染 HTML。
 - 如果账号无 `freepublish` 权限，`--publish` 可能返回 `48001`，此时保留草稿手动发布。
 - 若创建草稿时报 `41005 media data missing`，请通过 `--cover-image` 指定封面图。
+- 正文里的 `<img>` / Markdown 图片不能直接依赖外链；发布前应上传到微信正文图片接口 `media/uploadimg`，再把图片 URL 替换成微信返回的 URL。
+- 封面图与正文图是两套机制：封面需要 `thumb_media_id`，正文图需要 `uploadimg` 返回的 `url`。
 
 ## 输出结果
 

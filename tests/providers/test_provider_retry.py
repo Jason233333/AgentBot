@@ -154,6 +154,30 @@ async def test_chat_with_retry_explicit_override_beats_defaults() -> None:
     assert provider.last_kwargs["reasoning_effort"] == "low"
 
 
+@pytest.mark.asyncio
+async def test_chat_with_retry_forwards_extra_kwargs() -> None:
+    provider = ScriptedProvider([LLMResponse(content="ok")])
+
+    await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        session_key="test-session",
+    )
+
+    assert provider.last_kwargs["session_key"] == "test-session"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_with_retry_forwards_extra_kwargs() -> None:
+    provider = ScriptedProvider([LLMResponse(content="ok")])
+
+    await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        session_key="test-session",
+    )
+
+    assert provider.last_kwargs["session_key"] == "test-session"
+
+
 # ---------------------------------------------------------------------------
 # Image fallback tests
 # ---------------------------------------------------------------------------

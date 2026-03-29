@@ -81,6 +81,7 @@ class OpenAICodexProvider(LLMProvider):
         model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice)
 
@@ -90,6 +91,7 @@ class OpenAICodexProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice, on_content_delta)
 

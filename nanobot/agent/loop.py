@@ -268,6 +268,7 @@ class AgentLoop:
             hook=_LoopHook(),
             error_message="Sorry, I encountered an error calling the AI model.",
             concurrent_tools=True,
+            provider_kwargs={"session_key": session_key} if session_key else {},
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
@@ -304,6 +305,17 @@ class AgentLoop:
                 if result:
                     await self.bus.publish_outbound(result)
                 continue
+
+            interrupted = await self.cancel_session_tasks(
+                msg.session_key,
+                clear_provider_session=True,
+            )
+            if interrupted:
+                logger.info(
+                    "Interrupted {} running task(s) for session {} due to new inbound message",
+                    interrupted,
+                    msg.session_key,
+                )
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
             task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
@@ -313,6 +325,28 @@ class AgentLoop:
         if session_key not in self._session_locks:
             self._session_locks[session_key] = asyncio.Lock()
         return self._session_locks[session_key]
+
+    async def cancel_session_tasks(
+        self,
+        session_key: str,
+        *,
+        clear_provider_session: bool = False,
+    ) -> int:
+        """Cancel active agent/subagent work for a session and return count cancelled."""
+        tasks = self._active_tasks.pop(session_key, [])
+        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        sub_cancelled = await self.subagents.cancel_by_session(session_key)
+
+        if clear_provider_session and hasattr(self.provider, "clear_session"):
+            self.provider.clear_session(session_key)
+
+        return cancelled + sub_cancelled
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""

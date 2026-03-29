@@ -166,6 +166,50 @@ class TestDispatch:
             f"Expected both to start before either ends, got: {order}"
         )
 
+    @pytest.mark.asyncio
+    async def test_new_inbound_message_interrupts_same_session(self):
+        from nanobot.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        second_processed = asyncio.Event()
+
+        async def mock_process(m, **kwargs):
+            if m.content == "first":
+                started.set()
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            second_processed.set()
+            return OutboundMessage(channel="test", chat_id="c1", content=f"done:{m.content}")
+
+        loop._process_message = mock_process
+        loop._connect_mcp = AsyncMock()
+
+        run_task = asyncio.create_task(loop.run())
+        try:
+            await bus.publish_inbound(
+                InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="first")
+            )
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+
+            await bus.publish_inbound(
+                InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="second")
+            )
+
+            out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+            assert out.content == "done:second"
+            assert second_processed.is_set()
+            assert cancelled.is_set()
+        finally:
+            loop.stop()
+            run_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+
 
 class TestAgentLoopResume:
     @pytest.mark.asyncio

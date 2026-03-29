@@ -122,6 +122,7 @@ class AzureOpenAIProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """
         Send a chat completion request to Azure OpenAI.
@@ -220,6 +221,7 @@ class AzureOpenAIProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """Stream a chat completion via Azure OpenAI SSE."""
         deployment_name = model or self.default_model

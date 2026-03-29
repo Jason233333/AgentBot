@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "wechat-mp-cn": {
+      "version": "1.0.0",
+      "installedAt": 1774229521755
+    },
+    "wechat-mp-draft": {
+      "version": "1.0.0",
+      "installedAt": 1774229524961
+    },
+    "wechat-article-publisher": {
+      "version": "1.0.0",
+      "installedAt": 1774229582044
+    }
+  }
+}

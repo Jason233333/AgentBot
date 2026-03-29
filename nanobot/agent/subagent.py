@@ -53,6 +53,8 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.max_concurrent = max_concurrent
+        self.timeout_s = timeout_s
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -157,6 +159,7 @@ class SubagentManager:
         session_key: str | None = None,
     ) -> None:
         """Inner implementation of subagent execution (called inside wait_for)."""
+        sub_session_key = session_key or f"subagent:{task_id}"
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
@@ -196,6 +199,7 @@ class SubagentManager:
                 max_iterations_message="Task completed but no final response was generated.",
                 error_message=None,
                 fail_on_tool_error=True,
+                provider_kwargs={"session_key": sub_session_key},
             ))
             if result.stop_reason == "tool_error":
                 await self._announce_result(

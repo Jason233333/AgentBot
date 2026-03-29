@@ -41,6 +41,7 @@ class FallbackProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """Try primary provider, fall back to secondary on failure."""
         try:
@@ -52,6 +53,7 @@ class FallbackProvider(LLMProvider):
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 tool_choice=tool_choice,
+                **kwargs,
             )
             if response.finish_reason != "error":
                 return response
@@ -75,6 +77,7 @@ class FallbackProvider(LLMProvider):
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
                 tool_choice=tool_choice,
+                **kwargs,
             )
             if response.finish_reason != "error":
                 response.recovered_from_error = True

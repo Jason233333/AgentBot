@@ -22,6 +22,10 @@
 
 `jason_dev` 分支包含实验性功能，主要是 **Zero-Token Mode（零 Token 模式）**。
 
+- 配置 claude-code; `anthropic/claude-opus-4-6`
+
+- 配置 open-ai: `openai-codex/gpt-5.4`
+
 ### Zero-Token Mode
 
 Zero-Token Mode 通过 Playwright 浏览器自动化连接 claude.ai Web 界面，**无需 API Key 即可使用 Claude**。适合个人使用、开发调试等场景。

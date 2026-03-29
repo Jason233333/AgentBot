@@ -34,6 +34,7 @@ class AgentRunSpec:
     max_iterations_message: str | None = None
     concurrent_tools: bool = False
     fail_on_tool_error: bool = False
+    provider_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -72,6 +73,7 @@ class AgentRunner:
                 "messages": messages,
                 "tools": spec.tools.get_definitions(),
                 "model": spec.model,
+                **spec.provider_kwargs,
             }
             if spec.temperature is not None:
                 kwargs["temperature"] = spec.temperature
@@ -99,6 +101,14 @@ class AgentRunner:
             context.response = response
             context.usage = usage
             context.tool_calls = list(response.tool_calls)
+
+            if response.recovered_from_error:
+                messages.append(
+                    {"role": "user", "content": "网络出现了短暂故障，请继续你之前的工作。"}
+                )
+                context.stop_reason = "recovered"
+                await hook.after_iteration(context)
+                continue
 
             if response.has_tool_calls:
                 if hook.wants_streaming():
